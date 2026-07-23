@@ -100,6 +100,9 @@ torchrun \
     --pattern_eval_blocks "$EVAL_BLOCKS" --pattern_bootstrap_repeats 10000 \
     --lr 1e-6 --lr_sched cosine --min_lr 0.0 \
     --grad_checkpointing \
+    --fd_repr_models inception \
+    --fd_repr_pool_types cls \
+    --fd_target_sizes 256 \
     --fd_eigvalsh --fd_ema_beta 0.999 \
     --pattern_grad_clip 0 \
     --print_freq 20 --milestone_interval 10 --save_freq 5 \
