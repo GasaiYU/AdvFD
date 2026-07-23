@@ -140,6 +140,7 @@ export CKPT_ROOT=./checkpoints/base
 | Table 1c, multi-backbone ablation | `bash scripts/table_1c_backbone_combo.sh` |
 | Table 2, JiT-L repurposing | `bash scripts/table_2_repurpose_jit_L.sh` |
 | Table 3, pMF scalability | `MODEL_SIZE=L RES=256 bash scripts/table_3_pMF.sh` |
+| Frozen pMF universal pattern | `MODEL_SIZE=B RES=256 bash scripts/table_3_pMF_universal_pattern.sh` |
 | Table 3, iMF scalability | `MODEL_SIZE=L bash scripts/table_3_iMF.sh` |
 | Table 3, JiT scalability | `MODEL_SIZE=L bash scripts/table_3_JiT.sh` |
 
@@ -166,3 +167,25 @@ vit_large_patch16_224_mae_in256_t224_stats.npz
 vit_so400m_patch16_siglip_256_v2_webli_in256_t224_stats.npz
 jit_in256_stats.npz
 ```
+
+### Frozen-pMF universal dose-response pattern
+
+`table_3_pMF_universal_pattern.sh` freezes pMF and both representation
+encoders, then learns only one shared `3x16x16` pattern with Inception FD.
+CLIP is not loaded until held-out evaluation. Except for freezing pMF and
+optimizing the shared pattern, it retains the original pMF defaults:
+50k FD initialization samples, `fd_ema_beta=0.999`, global batch 1024,
+100x1250 training steps, five warmup epochs, and a `1e-6` cosine learning
+rate. Evaluation uses a disjoint 50k-generation alpha scan:
+
+```bash
+MODEL_SIZE=B RES=256 GPUS_PER_NODE=8 \
+CKPT_ROOT=./checkpoints/base \
+bash scripts/table_3_pMF_universal_pattern.sh
+```
+
+Outputs are written below
+`work_dirs/pMF_universal_pattern/<experiment>/`: pattern checkpoints and
+previews, `pattern_dose_response.csv`, and
+`pattern_dose_response_summary.json` (slopes, bootstrap confidence intervals,
+conflict score, and the sign-test result).
