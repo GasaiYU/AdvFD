@@ -9,7 +9,9 @@ The experiment has three strictly separated cached splits:
 The generator is used only when a cache shard is missing.  During pattern
 optimization the generator is unloaded, Inception is frozen, and CLIP is not
 loaded.  The only trainable object is a small set of real Fourier
-coefficients shared by every image.
+coefficients shared by every image.  Optimization gradients come from one
+joint FD over the complete optimization split, evaluated with a two-pass
+sufficient-statistics backward rather than noisy per-batch FDs.
 """
 
 from __future__ import annotations
@@ -42,7 +44,6 @@ if str(REPO_ROOT) not in sys.path:
 from frechet_distance.judges import infer_stats_path
 from frechet_distance.losses import (
     compute_frechet_distance_loss,
-    diff_all_gather,
     load_mu_and_sigma_reference,
     precompute_sigma_ref_sqrt,
 )
@@ -594,66 +595,90 @@ def _phase_for(
     return int(values[0]), int(values[1])
 
 
-class FixedBatchSampler:
-    """Deterministic shuffled sampler shared in structure across ranks."""
-
-    def __init__(self, count: int, batch_size: int, seed: int):
-        if batch_size > count:
-            raise ValueError(
-                f"Local gradient batch {batch_size} exceeds cache shard {count}"
-            )
-        self.count = count
-        self.batch_size = batch_size
-        self.generator = torch.Generator(device="cpu")
-        self.generator.manual_seed(seed)
-        self.permutation = torch.randperm(count, generator=self.generator)
-        self.cursor = 0
-
-    def next(self) -> torch.Tensor:
-        if self.cursor + self.batch_size > self.count:
-            self.permutation = torch.randperm(
-                self.count, generator=self.generator
-            )
-            self.cursor = 0
-        indices = self.permutation[
-            self.cursor : self.cursor + self.batch_size
-        ]
-        self.cursor += self.batch_size
-        return indices
-
-
-def _batch_fd_gradient(
+def _full_cached_fd_gradient(
     args: argparse.Namespace,
     inception: nn.Module,
     pattern: FourierPattern,
-    cached_images: torch.Tensor,
+    optimization_images: torch.Tensor,
     mu_ref: torch.Tensor,
     sigma_ref: torch.Tensor,
     sigma_ref_sqrt: torch.Tensor | None,
     *,
-    phase: tuple[int, int],
+    phase_round: int,
     normalize_pattern: bool,
 ) -> tuple[float, torch.Tensor]:
-    images = _decode_cached(cached_images, torch.device("cuda"))
-    perturbed = _to_unit_range(
-        _apply_fourier_pattern(
-            images,
-            pattern,
-            alpha=args.hack_train_alpha,
-            phase=phase,
-            normalize=normalize_pattern,
+    """Exact full-split FD gradient without retaining every image graph.
+
+    Let ``S=sum_i f_i`` and ``Q=sum_i f_i f_i^T``.  The first no-grad pass
+    computes global S/Q over the complete optimization split and differentiates
+    FD with respect to those sufficient statistics.  A second pass backprops
+    ``<dFD/dS, S_batch> + <dFD/dQ, Q_batch>`` batch by batch.  Summed across
+    batches and ranks, this is exactly the gradient of the one joint FD, not
+    an average of noisy per-batch FDs.
+    """
+    device = torch.device("cuda")
+    local_bsz = args.hack_gradient_batch_size // get_world_size()
+    num_local_batches = math.ceil(optimization_images.shape[0] / local_bsz)
+    feat_dim = int(mu_ref.shape[0])
+    feat_sum = torch.zeros(feat_dim, device=device, dtype=torch.float64)
+    feat_outer = torch.zeros(
+        feat_dim, feat_dim, device=device, dtype=torch.float64
+    )
+    local_count = 0
+
+    # Pass 1: full 5k sufficient statistics, without retaining activations.
+    with torch.no_grad():
+        for batch_index, start in enumerate(
+            range(0, optimization_images.shape[0], local_bsz)
+        ):
+            cached_images = optimization_images[start : start + local_bsz]
+            phase = _phase_for(
+                args.hack_phase_seed,
+                phase_round * num_local_batches + batch_index,
+                pattern.size,
+                args.hack_random_phase,
+            )
+            images = _decode_cached(cached_images, device)
+            perturbed = _to_unit_range(
+                _apply_fourier_pattern(
+                    images,
+                    pattern,
+                    alpha=args.hack_train_alpha,
+                    phase=phase,
+                    normalize=normalize_pattern,
+                )
+            )
+            features = _extract_primary_features(
+                inception,
+                perturbed,
+                use_amp=False,
+                amp_dtype=args.amp_dtype,
+            )
+            features64 = features.double()
+            feat_sum.add_(features64.sum(dim=0))
+            feat_outer.addmm_(features64.T, features64)
+            local_count += features.shape[0]
+            del images, perturbed, features, features64
+
+    count = torch.tensor([local_count], device=device, dtype=torch.int64)
+    _all_reduce_sum_(feat_sum)
+    _all_reduce_sum_(feat_outer)
+    _all_reduce_sum_(count)
+    global_count = int(count.item())
+    if global_count != args.hack_optimization_images:
+        raise RuntimeError(
+            f"Full optimization statistics contain {global_count} images, "
+            f"expected {args.hack_optimization_images}"
         )
-    )
-    local_features = _extract_primary_features(
-        inception,
-        perturbed,
-        use_amp=False,
-        amp_dtype=args.amp_dtype,
-    )
-    global_features = diff_all_gather(local_features)
-    mu = global_features.mean(dim=0)
-    centered = global_features - mu
-    sigma = centered.T @ centered / (global_features.shape[0] - 1)
+
+    # Differentiate FD only through the compact global S/Q tensors.
+    sum_variable = feat_sum.float().detach().requires_grad_(True)
+    outer_variable = feat_outer.float().detach().requires_grad_(True)
+    mu = sum_variable / global_count
+    sigma = (
+        outer_variable
+        - sum_variable.unsqueeze(1) * sum_variable.unsqueeze(0) / global_count
+    ) / (global_count - 1)
     if args.hack_cov_eps > 0:
         sigma = sigma + args.hack_cov_eps * torch.eye(
             sigma.shape[0], device=sigma.device, dtype=sigma.dtype
@@ -665,17 +690,92 @@ def _batch_fd_gradient(
         sigma=sigma,
         sigma_ref_sqrt=sigma_ref_sqrt,
     )
-    gradient = torch.autograd.grad(
-        fid, pattern.coeff, create_graph=False
-    )[0].detach()
-    _all_reduce_sum_(gradient)
-    if not torch.isfinite(gradient).all():
+    grad_sum, grad_outer = torch.autograd.grad(
+        fid,
+        (sum_variable, outer_variable),
+        create_graph=False,
+    )
+    grad_sum = grad_sum.detach()
+    grad_outer = grad_outer.detach()
+    fid_value = float(fid.detach())
+
+    # Pass 2: stream the same images/phases and accumulate the exact chain rule
+    # contribution to the one shared Fourier parameter.
+    pattern_gradient = torch.zeros_like(pattern.coeff)
+    for batch_index, start in enumerate(
+        range(0, optimization_images.shape[0], local_bsz)
+    ):
+        cached_images = optimization_images[start : start + local_bsz]
+        phase = _phase_for(
+            args.hack_phase_seed,
+            phase_round * num_local_batches + batch_index,
+            pattern.size,
+            args.hack_random_phase,
+        )
+        images = _decode_cached(cached_images, device)
+        perturbed = _to_unit_range(
+            _apply_fourier_pattern(
+                images,
+                pattern,
+                alpha=args.hack_train_alpha,
+                phase=phase,
+                normalize=normalize_pattern,
+            )
+        )
+        features = _extract_primary_features(
+            inception,
+            perturbed,
+            use_amp=False,
+            amp_dtype=args.amp_dtype,
+        )
+        batch_sum = features.sum(dim=0)
+        batch_outer = features.T @ features
+        statistic_surrogate = (
+            grad_sum.dot(batch_sum)
+            + (grad_outer * batch_outer).sum()
+        )
+        batch_gradient = torch.autograd.grad(
+            statistic_surrogate,
+            pattern.coeff,
+            create_graph=False,
+        )[0]
+        pattern_gradient.add_(batch_gradient.detach())
+        del (
+            images,
+            perturbed,
+            features,
+            batch_sum,
+            batch_outer,
+            statistic_surrogate,
+            batch_gradient,
+        )
+
+    _all_reduce_sum_(pattern_gradient)
+    if not torch.isfinite(pattern_gradient).all():
         raise FloatingPointError(
             "Non-finite Fourier gradient; increase --hack_cov_eps"
         )
-    value = float(fid.detach())
-    del images, perturbed, local_features, global_features, mu, centered, sigma
-    return value, gradient
+    del (
+        feat_sum,
+        feat_outer,
+        count,
+        sum_variable,
+        outer_variable,
+        mu,
+        sigma,
+        fid,
+        grad_sum,
+        grad_outer,
+    )
+    logger.info(
+        "[full-gradient] images=%d streaming_global_bsz=%d "
+        "joint_fid=%.6f phase_round=%d",
+        global_count,
+        args.hack_gradient_batch_size,
+        fid_value,
+        phase_round,
+    )
+    return fid_value, pattern_gradient
 
 
 @torch.no_grad()
@@ -807,53 +907,6 @@ def _save_pattern_preview(
     Image.fromarray(image).save(Path(args.log_dir) / "fourier_pattern.png")
 
 
-def _average_gradient(
-    args: argparse.Namespace,
-    inception: nn.Module,
-    pattern: FourierPattern,
-    optimization_images: torch.Tensor,
-    sampler: FixedBatchSampler,
-    mu_ref: torch.Tensor,
-    sigma_ref: torch.Tensor,
-    sigma_ref_sqrt: torch.Tensor | None,
-    *,
-    batches: int,
-    sequence_start: int,
-    normalize_pattern: bool,
-) -> tuple[float, torch.Tensor]:
-    gradient_sum = torch.zeros_like(pattern.coeff)
-    fid_sum = 0.0
-    for offset in range(batches):
-        indices = sampler.next()
-        phase = _phase_for(
-            args.hack_phase_seed,
-            sequence_start + offset,
-            pattern.size,
-            args.hack_random_phase,
-        )
-        fid, gradient = _batch_fd_gradient(
-            args,
-            inception,
-            pattern,
-            optimization_images[indices],
-            mu_ref,
-            sigma_ref,
-            sigma_ref_sqrt,
-            phase=phase,
-            normalize_pattern=normalize_pattern,
-        )
-        gradient_sum.add_(gradient)
-        fid_sum += fid
-        logger.info(
-            "[gradient] batch=%d/%d phase=%s raw_batch_fid=%.6f",
-            offset + 1,
-            batches,
-            phase,
-            fid,
-        )
-    return fid_sum / batches, gradient_sum / batches
-
-
 def _optimize_pattern(
     args: argparse.Namespace,
     inception: nn.Module,
@@ -864,12 +917,6 @@ def _optimize_pattern(
     optimization_split = CachedImageSplit(cache_root, "optimization")
     validation_split = CachedImageSplit(cache_root, "validation")
     optimization_images = optimization_split.load_all()
-    local_gradient_bsz = args.hack_gradient_batch_size // get_world_size()
-    sampler = FixedBatchSampler(
-        optimization_split.count,
-        local_gradient_bsz,
-        args.hack_gradient_seed,
-    )
 
     mu_ref, sigma_ref = load_mu_and_sigma_reference(args.fid_stats_path)
     sigma_ref_sqrt = (
@@ -898,17 +945,15 @@ def _optimize_pattern(
     )
 
     started = time.perf_counter()
-    one_shot_batch_fid, one_shot_gradient = _average_gradient(
+    one_shot_full_fid, one_shot_gradient = _full_cached_fd_gradient(
         args,
         inception,
         pattern,
         optimization_images,
-        sampler,
         mu_ref,
         sigma_ref,
         sigma_ref_sqrt,
-        batches=args.hack_gradient_batches,
-        sequence_start=0,
+        phase_round=0,
         normalize_pattern=False,
     )
     gradient_rms = float(
@@ -951,9 +996,9 @@ def _optimize_pattern(
         validation_baseline_fid=validation_baseline,
     )
     logger.info(
-        "[one-shot] mean_batch_fid=%.6f gradient_rms=%.6g "
+        "[one-shot] full_optimization_fid=%.6f gradient_rms=%.6g "
         "validation_fid=%.6f delta_vs_zero=%+.6f elapsed=%.1fs",
-        one_shot_batch_fid,
+        one_shot_full_fid,
         gradient_rms,
         one_shot_val,
         one_shot_val - validation_baseline,
@@ -967,28 +1012,25 @@ def _optimize_pattern(
                 "hack/validation_delta": one_shot_val
                 - validation_baseline,
                 "hack/gradient_rms": gradient_rms,
+                "hack/one_shot_full_optimization_fid": one_shot_full_fid,
             },
             step=0,
         )
 
     checks_without_improvement = 0
-    sequence = args.hack_gradient_batches
     last_validated_step = 0
     for step in range(1, args.hack_pgd_steps + 1):
-        mean_batch_fid, gradient = _average_gradient(
+        full_optimization_fid, gradient = _full_cached_fd_gradient(
             args,
             inception,
             pattern,
             optimization_images,
-            sampler,
             mu_ref,
             sigma_ref,
             sigma_ref_sqrt,
-            batches=args.hack_pgd_batches_per_step,
-            sequence_start=sequence,
+            phase_round=step,
             normalize_pattern=True,
         )
-        sequence += args.hack_pgd_batches_per_step
         gradient_rms_tensor = gradient.square().mean().add(1e-12).sqrt()
         with torch.no_grad():
             pattern.coeff.add_(
@@ -1037,11 +1079,12 @@ def _optimize_pattern(
         else:
             checks_without_improvement += 1
         logger.info(
-            "[PGD] step=%d/%d mean_batch_fid=%.6f validation_fid=%.6f "
+            "[PGD] step=%d/%d full_optimization_fid=%.6f "
+            "validation_fid=%.6f "
             "best=%.6f improved=%s patience=%d/%d",
             step,
             args.hack_pgd_steps,
-            mean_batch_fid,
+            full_optimization_fid,
             validation_fid,
             best_val,
             improved,
@@ -1055,7 +1098,7 @@ def _optimize_pattern(
                     "hack/validation_delta": validation_fid
                     - validation_baseline,
                     "hack/best_validation_fid": best_val,
-                    "hack/pgd_batch_fid": mean_batch_fid,
+                    "hack/pgd_full_optimization_fid": full_optimization_fid,
                 },
                 step=step,
             )
@@ -1088,7 +1131,7 @@ def _optimize_pattern(
         "selected_pgd_step": best_step,
         "last_validated_pgd_step": last_validated_step,
         "one_shot_gradient_rms": gradient_rms,
-        "one_shot_mean_batch_fid": one_shot_batch_fid,
+        "one_shot_full_optimization_fid": one_shot_full_fid,
     }
 
 
@@ -1406,10 +1449,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--hack_gradient_batch_size must be >=2 and divisible by WORLD_SIZE"
         )
-    if args.hack_gradient_batches < 1:
-        raise ValueError("--hack_gradient_batches must be positive")
-    if args.hack_pgd_steps < 0 or args.hack_pgd_batches_per_step < 1:
-        raise ValueError("Invalid PGD step/batch configuration")
+    if args.hack_pgd_steps < 0:
+        raise ValueError("--hack_pgd_steps must be non-negative")
     if args.hack_validate_every < 1:
         raise ValueError("--hack_validate_every must be positive")
     if args.hack_pgd_step_size <= 0:
@@ -1480,10 +1521,13 @@ def get_args_parser() -> argparse.ArgumentParser:
         "--hack_cache_dtype",
         choices=["uint8", "float16"],
         default="uint8",
-        help="uint8 is ~12GB for 60k 256px images; float16 is lossless-ish but 2x larger",
+        help=(
+            "uint8 is ~20.6GB for the default 105k 256px images; "
+            "float16 is lossless-ish but 2x larger"
+        ),
     )
     parser.add_argument("--hack_overwrite_cache", action="store_true")
-    parser.add_argument("--hack_optimization_images", type=int, default=5_000)
+    parser.add_argument("--hack_optimization_images", type=int, default=50_000)
     parser.add_argument("--hack_validation_images", type=int, default=5_000)
     parser.add_argument("--hack_test_images", type=int, default=50_000)
     parser.add_argument("--hack_optimization_seed", type=int, default=12_345)
@@ -1504,10 +1548,11 @@ def get_args_parser() -> argparse.ArgumentParser:
         "--hack_gradient_batch_size",
         type=int,
         default=256,
-        help="global batch size used by each averaged FD gradient",
+        help=(
+            "global streaming batch size; every FD gradient still uses the "
+            "complete optimization split"
+        ),
     )
-    parser.add_argument("--hack_gradient_batches", type=int, default=16)
-    parser.add_argument("--hack_gradient_seed", type=int, default=45_678)
     parser.add_argument("--hack_phase_seed", type=int, default=56_789)
     parser.add_argument(
         "--hack_random_phase",
@@ -1520,11 +1565,16 @@ def get_args_parser() -> argparse.ArgumentParser:
         dest="hack_random_phase",
     )
     parser.set_defaults(hack_random_phase=True)
-    parser.add_argument("--hack_cov_eps", type=float, default=1e-4)
-    parser.add_argument("--hack_pgd_steps", type=int, default=20)
     parser.add_argument(
-        "--hack_pgd_batches_per_step", type=int, default=1
+        "--hack_cov_eps",
+        type=float,
+        default=0.0,
+        help=(
+            "optional fake-covariance diagonal stabilization; the default "
+            "full-50k objective matches ordinary FID without it"
+        ),
     )
+    parser.add_argument("--hack_pgd_steps", type=int, default=0)
     parser.add_argument("--hack_pgd_step_size", type=float, default=0.25)
     parser.add_argument("--hack_validate_every", type=int, default=5)
     parser.add_argument(

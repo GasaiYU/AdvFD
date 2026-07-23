@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cached, low-dimensional universal Inception-FD direction for frozen pMF.
 #
-# First run: generate fixed 5k/5k/50k uint8 cache, optimize the Fourier
+# First run: generate fixed 50k/5k/50k uint8 cache, optimize the Fourier
 # pattern, validate with Inception only, then evaluate Inception + CLIP.
 # Later runs reuse the cache and never load the generator during optimization.
 
@@ -23,11 +23,10 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 : "${ENABLE_WANDB:=1}"
 : "${MODEL_SIZE:=B}"
 : "${RES:=256}"
-: "${OPT_IMAGES:=5000}"
+: "${OPT_IMAGES:=50000}"
 : "${VAL_IMAGES:=5000}"
 : "${TEST_IMAGES:=50000}"
-: "${GRADIENT_BATCHES:=16}"
-: "${PGD_STEPS:=20}"
+: "${PGD_STEPS:=0}"
 : "${CACHE_ROOT:=./work_dirs/hacking_cache}"
 
 TOTAL_GPUS=$(( NNODES * GPUS_PER_NODE ))
@@ -105,15 +104,13 @@ torchrun \
     --hack_validation_images "$VAL_IMAGES" \
     --hack_test_images "$TEST_IMAGES" \
     --hack_gradient_batch_size "$GRADIENT_BSZ" \
-    --hack_gradient_batches "$GRADIENT_BATCHES" \
     --hack_pattern_size 16 \
     --hack_fourier_modes 48 \
     --hack_fourier_min_radius 0.15 \
     --hack_fourier_max_radius 0.55 \
     --hack_train_alpha 0.0313725490196 \
-    --hack_cov_eps 1e-4 \
+    --hack_cov_eps 0 \
     --hack_pgd_steps "$PGD_STEPS" \
-    --hack_pgd_batches_per_step 1 \
     --hack_pgd_step_size 0.25 \
     --hack_validate_every 5 \
     --hack_early_stop_patience 2 \
