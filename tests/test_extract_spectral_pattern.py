@@ -184,9 +184,11 @@ class SpectralPatternTest(unittest.TestCase):
             self.assertEqual(manifest["processed_this_run"], 1)
             self.assertEqual(manifest["resumed_existing"], 11)
             self.assertEqual(manifest["repaired_invalid_images"], 1)
+            self.assertEqual(manifest["crop_size"], 256)
             self.assertEqual(len(list(output_dir.glob("*.png"))), 12)
             with Image.open(outputs[3]) as repaired:
                 repaired.load()
+                self.assertEqual(repaired.size, (256, 256))
 
     def test_flat_image_directory_matches_uint8_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

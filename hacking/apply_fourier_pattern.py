@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
+from utils.data_util import center_crop_arr
+
 
 IMAGE_SUFFIXES = {
     ".bmp",
@@ -195,7 +197,11 @@ def _output_path(
     return destination
 
 
-def _load_rgb(path: Path) -> tuple[torch.Tensor, Image.Image | None]:
+def _load_rgb(
+    path: Path,
+    *,
+    crop_size: int,
+) -> tuple[torch.Tensor, Image.Image | None]:
     with Image.open(path) as opened:
         image = ImageOps.exif_transpose(opened)
         alpha_channel = (
@@ -203,7 +209,15 @@ def _load_rgb(path: Path) -> tuple[torch.Tensor, Image.Image | None]:
             if "A" in image.getbands()
             else None
         )
-        rgb = np.asarray(image.convert("RGB"), dtype=np.float32).copy()
+        rgb_image = image.convert("RGB")
+        if crop_size > 0:
+            # Match the ADM/ImageNet preprocessing used to compute the
+            # repository's reference FID statistics: resize the short side
+            # to crop_size, then take a centered square crop.
+            rgb_image = center_crop_arr(rgb_image, crop_size)
+            if alpha_channel is not None:
+                alpha_channel = center_crop_arr(alpha_channel, crop_size)
+        rgb = np.asarray(rgb_image, dtype=np.float32).copy()
     tensor = torch.from_numpy(rgb).permute(2, 0, 1).div_(255.0)
     return tensor, alpha_channel
 
@@ -292,6 +306,16 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shift_y", type=int, default=0)
     parser.add_argument("--shift_x", type=int, default=0)
     parser.add_argument(
+        "--crop_size",
+        type=int,
+        default=256,
+        help=(
+            "ADM-style center-crop size applied before the pattern; "
+            "default 256 matches ImageNet reference statistics. Use 0 "
+            "to preserve each input image's original dimensions"
+        ),
+    )
+    parser.add_argument(
         "--output_format",
         choices=["preserve", "png"],
         default="preserve",
@@ -375,6 +399,8 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("--num_workers must be positive")
     if args.log_every < 1:
         raise ValueError("--log_every must be positive")
+    if args.crop_size < 0:
+        raise ValueError("--crop_size must be non-negative")
     if args.num_workers > 1:
         # Each image operation is small. Avoid nesting PyTorch's CPU thread
         # pool inside the outer image-level worker pool.
@@ -466,6 +492,7 @@ def main(args: argparse.Namespace) -> None:
         f"workers={args.num_workers} alpha={args.alpha:.10g} "
         f"alpha_space={args.alpha_space} "
         f"effective_pixel_rms={effective_pixel_rms:.10g} "
+        f"crop_size={args.crop_size} "
         f"phase=({args.shift_y},{args.shift_x})"
     )
 
@@ -473,7 +500,10 @@ def main(args: argparse.Namespace) -> None:
         item: tuple[Path, Path],
     ) -> None:
         source, destination = item
-        image, alpha_channel = _load_rgb(source)
+        image, alpha_channel = _load_rgb(
+            source,
+            crop_size=args.crop_size,
+        )
         patched = apply_pattern(
             image,
             pattern,
@@ -529,6 +559,7 @@ def main(args: argparse.Namespace) -> None:
         "alpha": args.alpha,
         "alpha_space": args.alpha_space,
         "effective_pixel_rms": effective_pixel_rms,
+        "crop_size": args.crop_size,
         "shift_y": args.shift_y,
         "shift_x": args.shift_x,
         "num_images": len(sources),
