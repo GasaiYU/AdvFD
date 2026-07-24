@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Find the strongest visible Fourier pattern that still beats zero-pattern FID.
 #
-# Start from an already successful low-alpha checkpoint and increase alpha in
-# small stages. Each stage fits/selects on the same fixed 50k optimization set.
-# A failed stage is not adopted: the script stops and reports the last
-# successful nonzero checkpoint.
+# Start from a zero Fourier pattern at a small alpha, then increase alpha in
+# stages. Each stage fits/selects on the same fixed 50k optimization set. A
+# failed stage is not adopted: the script stops and reports the last successful
+# nonzero checkpoint.
 
 set -euo pipefail
 
@@ -27,34 +27,39 @@ set -euo pipefail
 : "${CACHE_ROOT:=./work_dirs/hacking_cache}"
 : "${ENABLE_WANDB:=1}"
 
-: "${SOURCE_PATTERN:=/mmu-vcg/gaomingju/workspace/foundation/FD-Loss-Ours/work_dirs/pMF_universal_pattern/pMF_B_256-cached-fourier-inception/checkpoints/fourier_pattern_selected.pth}"
-: "${START_ALPHA:=0.05}"
-: "${ALPHA_STAGES:=0.075 0.1 0.125 0.15 0.175 0.2}"
-: "${EVAL_ALPHAS:=0 0.025 0.05 0.075 0.1 0.125 0.15 0.175 0.2}"
+: "${ALPHA_STAGES:=0.0313725490196 0.05 0.075 0.1 0.125 0.15 0.175 0.2}"
+: "${EVAL_ALPHAS:=0 0.0156862745098 0.0313725490196 0.05 0.075 0.1 0.125 0.15 0.175 0.2}"
+: "${INITIAL_PGD_STEPS:=50}"
 : "${PGD_STEPS_PER_STAGE:=20}"
 : "${PGD_STEP_SIZE:=0.02}"
-: "${BASE_EXP_NAME:=pMF_B_256-visible-curriculum}"
+: "${BASE_EXP_NAME:=pMF_B_256-visible-from-scratch}"
 : "${OUTPUT_ROOT:=./work_dirs}"
-
-if [[ ! -f "$SOURCE_PATTERN" ]]; then
-    echo "[ERR] source pattern checkpoint not found: $SOURCE_PATTERN"
-    echo "[ERR] set SOURCE_PATTERN to fourier_pattern_selected.pth or fourier_pattern_overfit_selected.pth"
-    exit 1
-fi
 
 read -r -a STAGES <<< "$ALPHA_STAGES"
 read -r -a DOSE_VALUES <<< "$EVAL_ALPHAS"
 
-current_pattern="$SOURCE_PATTERN"
-last_success_alpha="$START_ALPHA"
-last_success_pattern="$SOURCE_PATTERN"
+current_pattern=""
+last_success_alpha="none"
+last_success_pattern="none"
 
-for target_alpha in "${STAGES[@]}"; do
+for stage_index in "${!STAGES[@]}"; do
+    target_alpha="${STAGES[$stage_index]}"
     alpha_label="${target_alpha//./p}"
     stage_exp="${BASE_EXP_NAME}-alpha${alpha_label}"
 
     echo "[curriculum] target_alpha=${target_alpha}"
-    echo "[curriculum] init=${current_pattern}"
+    continuation_args=()
+    if (( stage_index == 0 )); then
+        echo "[curriculum] init=zero-pattern (from scratch)"
+        stage_pgd_steps="$INITIAL_PGD_STEPS"
+    else
+        echo "[curriculum] init=${current_pattern}"
+        stage_pgd_steps="$PGD_STEPS_PER_STAGE"
+        continuation_args=(
+            --hack_init_pattern_checkpoint
+            "$current_pattern"
+        )
+    fi
 
     CKPT_ROOT="$CKPT_ROOT" \
     MODEL_SIZE="$MODEL_SIZE" \
@@ -73,11 +78,11 @@ for target_alpha in "${STAGES[@]}"; do
     CACHE_ROOT="$CACHE_ROOT" \
     ENABLE_WANDB="$ENABLE_WANDB" \
     EXP_NAME="$stage_exp" \
-    PGD_STEPS="$PGD_STEPS_PER_STAGE" \
+    PGD_STEPS="$stage_pgd_steps" \
     bash hacking/run_pmf_fourier_universal.sh \
         --output_dir "$OUTPUT_ROOT" \
         --hack_overfit_only \
-        --hack_init_pattern_checkpoint "$current_pattern" \
+        "${continuation_args[@]}" \
         --hack_train_alpha "$target_alpha" \
         --hack_pgd_step_size "$PGD_STEP_SIZE" \
         --hack_eval_alphas "${DOSE_VALUES[@]}"
@@ -96,7 +101,11 @@ for target_alpha in "${STAGES[@]}"; do
     )"
     if [[ "$fit_success" != "1" ]]; then
         echo "[curriculum] target alpha ${target_alpha} did not beat the zero-pattern baseline."
-        echo "[curriculum] stopping before adopting the stage's zero fallback."
+        if (( stage_index == 0 )); then
+            echo "[curriculum] from-scratch initialization failed; no nonzero pattern was selected."
+        else
+            echo "[curriculum] stopping before adopting the stage's zero fallback."
+        fi
         break
     fi
 

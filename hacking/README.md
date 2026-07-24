@@ -96,25 +96,27 @@ will only save a nonzero final selection if that pattern, or a PGD refinement
 of it, beats zero at the new target alpha. Use a new `EXP_NAME` so the source
 checkpoint is never overwritten.
 
-To search automatically for the strongest visibly textured pattern, start
-from an existing successful checkpoint and run the alpha curriculum:
+To search automatically from scratch for the strongest visibly textured
+pattern, run the alpha curriculum:
 
 ```bash
 bash hacking/run_pmf_visible_pattern_curriculum.sh
 ```
 
-The checked-in defaults already point to the pMF-B/256 alpha-0.05 checkpoint,
-use 8 GPUs and the fixed 50k optimization cache, enable W&B, and configure all
-curriculum/PGD hyperparameters. No environment variables are required for that
-setup.
+The checked-in defaults use pMF-B/256, 8 GPUs and the fixed 50k optimization
+cache, enable W&B, and configure all curriculum/PGD hyperparameters. No
+environment variables or pretrained pattern checkpoint are required.
 
 By default it tries
-`0.075, 0.1, 0.125, 0.15, 0.175, 0.2`. It adopts a stage only when its selected
-nonzero pattern beats the zero-pattern FID on the fixed 50k set. At the first
-failed stage it stops and prints the strongest successful alpha and checkpoint
-instead of accidentally continuing from the zero fallback. Override
-`ALPHA_STAGES`, `PGD_STEPS_PER_STAGE`, or `PGD_STEP_SIZE` through environment
-variables when a finer or more intensive search is needed.
+`8/255, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2`. The first stage learns
+from an exactly zero pattern; later stages initialize only from the preceding
+successful nonzero selection. The initial stage uses 50 PGD steps and later
+stages use 20. It adopts a stage only when that selection beats the zero-pattern
+FID on the fixed 50k set. At the first failed stage it stops and prints the
+strongest successful alpha and checkpoint instead of accidentally continuing
+from the zero fallback. Override `ALPHA_STAGES`, `INITIAL_PGD_STEPS`,
+`PGD_STEPS_PER_STAGE`, or `PGD_STEP_SIZE` through environment variables when a
+finer or more intensive search is needed.
 
 Generate/verify the three caches and stop:
 
