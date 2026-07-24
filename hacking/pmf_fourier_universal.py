@@ -665,11 +665,12 @@ def _full_cached_fd_gradient(
 ) -> tuple[float, torch.Tensor]:
     """Exact full-split FD gradient without retaining every image graph.
 
-    Let ``S=sum_i f_i`` and ``Q=sum_i f_i f_i^T``.  The first no-grad pass
-    computes global S/Q over the complete optimization split and differentiates
-    FD with respect to those sufficient statistics.  A second pass backprops
-    ``<dFD/dS, S_batch> + <dFD/dQ, Q_batch>`` batch by batch.  Summed across
-    batches and ranks, this is exactly the gradient of the one joint FD, not
+    The first no-grad pass forms the global feature mean and covariance in
+    float64, avoiding catastrophic cancellation from casting raw first/second
+    moments to float32. FD is differentiated with respect to those compact
+    statistics. A second pass applies the analytic per-feature chain rule and
+    backpropagates it batch by batch to the shared Fourier coefficients.
+    Summed across batches and ranks, this is the gradient of one joint FD, not
     an average of noisy per-batch FDs.
     """
     device = torch.device("cuda")
@@ -727,36 +728,44 @@ def _full_cached_fd_gradient(
             f"expected {args.hack_optimization_images}"
         )
 
-    # Differentiate FD only through the compact global S/Q tensors.
-    sum_variable = feat_sum.float().detach().requires_grad_(True)
-    outer_variable = feat_outer.float().detach().requires_grad_(True)
-    mu = sum_variable / global_count
-    sigma = (
-        outer_variable
-        - sum_variable.unsqueeze(1) * sum_variable.unsqueeze(0) / global_count
+    # Form centered statistics before the float32 cast. Inception features
+    # have large nonzero means, so casting S/Q first makes Q - SS^T/N lose
+    # enough precision to visibly change the reported joint FID.
+    mu64 = feat_sum / global_count
+    sigma64 = (
+        feat_outer
+        - feat_sum.unsqueeze(1) * feat_sum.unsqueeze(0) / global_count
     ) / (global_count - 1)
+    mu_variable = mu64.float().detach().requires_grad_(True)
+    sigma_variable = sigma64.float().detach().requires_grad_(True)
+    sigma_for_fd = sigma_variable
     if args.hack_cov_eps > 0:
-        sigma = sigma + args.hack_cov_eps * torch.eye(
-            sigma.shape[0], device=sigma.device, dtype=sigma.dtype
+        sigma_for_fd = sigma_for_fd + args.hack_cov_eps * torch.eye(
+            sigma_for_fd.shape[0],
+            device=sigma_for_fd.device,
+            dtype=sigma_for_fd.dtype,
         )
     fid = compute_frechet_distance_loss(
         mu_ref,
         sigma_ref,
-        mu=mu,
-        sigma=sigma,
+        mu=mu_variable,
+        sigma=sigma_for_fd,
         sigma_ref_sqrt=sigma_ref_sqrt,
     )
-    grad_sum, grad_outer = torch.autograd.grad(
+    grad_mu, grad_sigma = torch.autograd.grad(
         fid,
-        (sum_variable, outer_variable),
+        (mu_variable, sigma_variable),
         create_graph=False,
     )
-    grad_sum = grad_sum.detach()
-    grad_outer = grad_outer.detach()
+    grad_mu = grad_mu.detach()
+    grad_sigma = grad_sigma.detach()
+    global_mu = mu_variable.detach()
+    symmetric_grad_sigma = (grad_sigma + grad_sigma.T).detach()
     fid_value = float(fid.detach())
 
-    # Pass 2: stream the same images/phases and accumulate the exact chain rule
-    # contribution to the one shared Fourier parameter.
+    # For unbiased covariance C = sum_i (f_i-mu)(f_i-mu)^T/(N-1):
+    # dL/df_i = dL/dmu/N
+    #          + (f_i-mu) @ (dL/dC + dL/dC^T)/(N-1).
     pattern_gradient = torch.zeros_like(pattern.coeff)
     for batch_index, start in enumerate(
         range(0, optimization_images.shape[0], local_bsz)
@@ -784,12 +793,15 @@ def _full_cached_fd_gradient(
             use_amp=False,
             amp_dtype=args.amp_dtype,
         )
-        batch_sum = features.sum(dim=0)
-        batch_outer = features.T @ features
-        statistic_surrogate = (
-            grad_sum.dot(batch_sum)
-            + (grad_outer * batch_outer).sum()
+        feature_gradient = (
+            grad_mu.unsqueeze(0) / global_count
+            + (features.detach() - global_mu)
+            @ symmetric_grad_sigma
+            / (global_count - 1)
         )
+        statistic_surrogate = (
+            features * feature_gradient.detach()
+        ).sum()
         batch_gradient = torch.autograd.grad(
             statistic_surrogate,
             pattern.coeff,
@@ -800,8 +812,7 @@ def _full_cached_fd_gradient(
             images,
             perturbed,
             features,
-            batch_sum,
-            batch_outer,
+            feature_gradient,
             statistic_surrogate,
             batch_gradient,
         )
@@ -815,13 +826,16 @@ def _full_cached_fd_gradient(
         feat_sum,
         feat_outer,
         count,
-        sum_variable,
-        outer_variable,
-        mu,
-        sigma,
+        mu64,
+        sigma64,
+        mu_variable,
+        sigma_variable,
+        sigma_for_fd,
         fid,
-        grad_sum,
-        grad_outer,
+        grad_mu,
+        grad_sigma,
+        global_mu,
+        symmetric_grad_sigma,
     )
     logger.info(
         "[full-gradient] images=%d streaming_global_bsz=%d "
@@ -1255,111 +1269,172 @@ def _overfit_pattern(
         validation_baseline_fid=baseline_fid,
     )
 
-    # The local derivative only fixes an orientation.  Since RMS
-    # normalization turns it into a finite perturbation, evaluate both signs
-    # on the same overfit set before starting iterative refinement.
-    zero_joint_fid, zero_gradient = _full_cached_fd_gradient(
-        args,
-        inception,
-        pattern,
-        optimization_images,
-        mu_ref,
-        sigma_ref,
-        sigma_ref_sqrt,
-        phase_round=0,
-        normalize_pattern=False,
-    )
-    zero_gradient_rms = float(
-        zero_gradient.square().mean().sqrt().item()
-    )
-    if not math.isfinite(zero_gradient_rms) or zero_gradient_rms <= 0:
-        raise FloatingPointError(
-            f"Invalid zero-pattern gradient RMS: {zero_gradient_rms}"
-        )
+    initial_checkpoint: dict[str, object] | None = None
+    zero_joint_fid: float | None = None
+    zero_gradient_rms: float | None = None
+    descent_fid: float | None = None
+    opposite_fid: float | None = None
 
-    with torch.no_grad():
-        pattern.coeff.copy_(
-            -zero_gradient
-            / zero_gradient.square().mean().add(1e-12).sqrt()
-        )
-        pattern.normalize_coefficients_()
-    descent_fid = _cached_inception_fd(
-        args,
-        inception,
-        pattern,
-        split,
-        ref_mu,
-        ref_sigma,
-        alpha=args.hack_train_alpha,
-    )
-    descent_state = _clone_pattern_state(pattern)
-    history.append(
-        {
-            "step": 0,
-            "stage": "negative_gradient",
-            "fid": descent_fid,
-            "delta_from_baseline": descent_fid - baseline_fid,
-            "step_size": 0.0,
-            "accepted": False,
-        }
-    )
-
-    with torch.no_grad():
-        pattern.coeff.mul_(-1.0)
-    opposite_fid = _cached_inception_fd(
-        args,
-        inception,
-        pattern,
-        split,
-        ref_mu,
-        ref_sigma,
-        alpha=args.hack_train_alpha,
-    )
-    opposite_state = _clone_pattern_state(pattern)
-    history.append(
-        {
-            "step": 0,
-            "stage": "positive_gradient",
-            "fid": opposite_fid,
-            "delta_from_baseline": opposite_fid - baseline_fid,
-            "step_size": 0.0,
-            "accepted": False,
-        }
-    )
-
-    if descent_fid <= opposite_fid:
-        pattern.load_state_dict(descent_state)
-        current_fid = descent_fid
-        current_stage = "negative_gradient"
-    else:
-        pattern.load_state_dict(opposite_state)
-        current_fid = opposite_fid
-        current_stage = "positive_gradient"
-    for row in history[-2:]:
-        row["accepted"] = row["stage"] == current_stage
-
-    if current_fid < best_fid:
-        best_fid = current_fid
-        best_state = _clone_pattern_state(pattern)
-        best_stage = current_stage
-        _save_pattern_checkpoint(
-            args,
+    if args.hack_init_pattern_checkpoint is not None:
+        # Continuation deliberately starts from the previously selected
+        # direction instead of recomputing a normalized finite jump at zero.
+        initial_checkpoint = _load_pattern_checkpoint(
+            args.hack_init_pattern_checkpoint,
             pattern,
-            name="fourier_pattern_overfit_best.pth",
-            stage=best_stage,
-            step=0,
-            validation_fid=best_fid,
-            validation_baseline_fid=baseline_fid,
         )
-    logger.info(
-        "[overfit] baseline=%.6f joint_zero_fid=%.6f "
-        "negative_gradient=%.6f positive_gradient=%.6f selected=%s",
-        baseline_fid,
-        zero_joint_fid,
-        descent_fid,
-        opposite_fid,
-        current_stage,
-    )
+        current_fid = _cached_inception_fd(
+            args,
+            inception,
+            pattern,
+            split,
+            ref_mu,
+            ref_sigma,
+            alpha=args.hack_train_alpha,
+        )
+        current_stage = "initial_checkpoint"
+        history.append(
+            {
+                "step": 0,
+                "stage": current_stage,
+                "fid": current_fid,
+                "delta_from_baseline": current_fid - baseline_fid,
+                "step_size": 0.0,
+                "accepted": True,
+                "source_checkpoint": args.hack_init_pattern_checkpoint,
+                "source_train_alpha": initial_checkpoint.get("train_alpha"),
+            }
+        )
+        if current_fid < best_fid:
+            best_fid = current_fid
+            best_state = _clone_pattern_state(pattern)
+            best_stage = current_stage
+            _save_pattern_checkpoint(
+                args,
+                pattern,
+                name="fourier_pattern_overfit_best.pth",
+                stage=best_stage,
+                step=0,
+                validation_fid=best_fid,
+                validation_baseline_fid=baseline_fid,
+            )
+        logger.info(
+            "[overfit continuation] baseline=%.6f initial_fid=%.6f "
+            "source_alpha=%s target_alpha=%.8f best=%.6f",
+            baseline_fid,
+            current_fid,
+            initial_checkpoint.get("train_alpha"),
+            args.hack_train_alpha,
+            best_fid,
+        )
+    else:
+        # The local derivative only fixes an orientation. Since RMS
+        # normalization turns it into a finite perturbation, evaluate both
+        # signs on the same overfit set before iterative refinement.
+        zero_joint_fid, zero_gradient = _full_cached_fd_gradient(
+            args,
+            inception,
+            pattern,
+            optimization_images,
+            mu_ref,
+            sigma_ref,
+            sigma_ref_sqrt,
+            phase_round=0,
+            normalize_pattern=False,
+        )
+        zero_gradient_rms = float(
+            zero_gradient.square().mean().sqrt().item()
+        )
+        if (
+            not math.isfinite(zero_gradient_rms)
+            or zero_gradient_rms <= 0
+        ):
+            raise FloatingPointError(
+                f"Invalid zero-pattern gradient RMS: {zero_gradient_rms}"
+            )
+
+        with torch.no_grad():
+            pattern.coeff.copy_(
+                -zero_gradient
+                / zero_gradient.square().mean().add(1e-12).sqrt()
+            )
+            pattern.normalize_coefficients_()
+        descent_fid = _cached_inception_fd(
+            args,
+            inception,
+            pattern,
+            split,
+            ref_mu,
+            ref_sigma,
+            alpha=args.hack_train_alpha,
+        )
+        descent_state = _clone_pattern_state(pattern)
+        history.append(
+            {
+                "step": 0,
+                "stage": "negative_gradient",
+                "fid": descent_fid,
+                "delta_from_baseline": descent_fid - baseline_fid,
+                "step_size": 0.0,
+                "accepted": False,
+            }
+        )
+
+        with torch.no_grad():
+            pattern.coeff.mul_(-1.0)
+        opposite_fid = _cached_inception_fd(
+            args,
+            inception,
+            pattern,
+            split,
+            ref_mu,
+            ref_sigma,
+            alpha=args.hack_train_alpha,
+        )
+        opposite_state = _clone_pattern_state(pattern)
+        history.append(
+            {
+                "step": 0,
+                "stage": "positive_gradient",
+                "fid": opposite_fid,
+                "delta_from_baseline": opposite_fid - baseline_fid,
+                "step_size": 0.0,
+                "accepted": False,
+            }
+        )
+
+        if descent_fid <= opposite_fid:
+            pattern.load_state_dict(descent_state)
+            current_fid = descent_fid
+            current_stage = "negative_gradient"
+        else:
+            pattern.load_state_dict(opposite_state)
+            current_fid = opposite_fid
+            current_stage = "positive_gradient"
+        for row in history[-2:]:
+            row["accepted"] = row["stage"] == current_stage
+
+        if current_fid < best_fid:
+            best_fid = current_fid
+            best_state = _clone_pattern_state(pattern)
+            best_stage = current_stage
+            _save_pattern_checkpoint(
+                args,
+                pattern,
+                name="fourier_pattern_overfit_best.pth",
+                stage=best_stage,
+                step=0,
+                validation_fid=best_fid,
+                validation_baseline_fid=baseline_fid,
+            )
+        logger.info(
+            "[overfit] baseline=%.6f joint_zero_fid=%.6f "
+            "negative_gradient=%.6f positive_gradient=%.6f selected=%s",
+            baseline_fid,
+            zero_joint_fid,
+            descent_fid,
+            opposite_fid,
+            current_stage,
+        )
 
     completed_steps = 0
     for step in range(1, args.hack_pgd_steps + 1):
@@ -1525,6 +1600,12 @@ def _overfit_pattern(
         "zero_gradient_rms": zero_gradient_rms,
         "negative_gradient_fid": descent_fid,
         "positive_gradient_fid": opposite_fid,
+        "initial_pattern_checkpoint": args.hack_init_pattern_checkpoint,
+        "initial_pattern_train_alpha": (
+            initial_checkpoint.get("train_alpha")
+            if initial_checkpoint is not None
+            else None
+        ),
         "alphas": list(args.hack_eval_alphas),
         "dose_response_beta_inception": beta_inception,
         "dose_response_success": beta_inception < 0,
@@ -1946,6 +2027,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--hack_overfit_only and --hack_eval_only are mutually exclusive"
         )
+    if (
+        args.hack_init_pattern_checkpoint is not None
+        and not args.hack_overfit_only
+    ):
+        raise ValueError(
+            "--hack_init_pattern_checkpoint currently requires "
+            "--hack_overfit_only"
+        )
     if args.hack_overfit_backtracks < 0:
         raise ValueError("--hack_overfit_backtracks must be non-negative")
     if not 0 < args.hack_overfit_backtrack_factor < 1:
@@ -2079,6 +2168,15 @@ def get_args_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hack_skip_final_eval", action="store_true")
     parser.add_argument("--hack_pattern_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--hack_init_pattern_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "initialize --hack_overfit_only refinement from a compatible "
+            "selected Fourier-pattern checkpoint"
+        ),
+    )
     return parser
 
 

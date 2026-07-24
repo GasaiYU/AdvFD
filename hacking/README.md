@@ -20,9 +20,9 @@ is controlled only by `alpha`; no `tanh` amplitude warm-up is used.
 
 Every optimization update uses the complete 50k optimization split. Images are
 streamed in small batches only to control memory. A two-pass sufficient-stat
-gradient first accumulates the global feature sum
-`S = sum(f)` and outer-product sum `Q = sum(ff^T)`, then backpropagates
-`dFD/dS` and `dFD/dQ` batch by batch. Consequently this is the gradient of one
+gradient first forms the global mean and covariance in float64, differentiates
+FD with respect to those stable statistics, then backpropagates the resulting
+per-feature gradients batch by batch. Consequently this is the gradient of one
 joint 50k-sample FD, not an average of statistically unreliable batch FIDs.
 
 ## Default run
@@ -75,6 +75,26 @@ backtracking, checkpoint selection, and the final dose response. It writes
 it is not evidence of held-out generalization. If a compatible full
 50k/5k/50k cache already exists, its optimization shard is reused. Otherwise
 the mode creates only the 50k optimization cache.
+
+Continue from a pattern selected at a smaller alpha instead of taking another
+normalized finite jump from zero:
+
+```bash
+EXP_NAME=pMF_B_256-fourier-overfit-alpha01 \
+PGD_STEPS=20 \
+bash hacking/run_pmf_fourier_universal.sh \
+  --hack_overfit_only \
+  --hack_init_pattern_checkpoint \
+  /path/to/alpha005/checkpoints/fourier_pattern_overfit_selected.pth \
+  --hack_train_alpha 0.1 \
+  --hack_pgd_step_size 0.02 \
+  --hack_eval_alphas 0 0.05 0.1 0.15 0.2
+```
+
+The continuation run still computes the zero-pattern FID as its baseline and
+will only save a nonzero final selection if that pattern, or a PGD refinement
+of it, beats zero at the new target alpha. Use a new `EXP_NAME` so the source
+checkpoint is never overwritten.
 
 Generate/verify the three caches and stop:
 
