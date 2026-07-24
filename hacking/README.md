@@ -123,3 +123,41 @@ Under
 
 CLIP is never used for one-shot direction estimation, PGD, early stopping, or
 checkpoint selection.
+
+## Apply a selected pattern to images
+
+Apply the exact exported spatial pattern to every image under a directory:
+
+```bash
+python hacking/apply_fourier_pattern.py \
+  --input_dir /path/to/input_images \
+  --output_dir /path/to/patched_images \
+  --pattern \
+  work_dirs/pMF_universal_pattern/pMF_B_256-fourier-overfit50k/fourier_pattern.npy \
+  --alpha 0.0313725490196
+```
+
+The default `--alpha_space model` matches the pMF experiment: images are
+converted from `[0,1]` to `[-1,1]`, the tiled pattern is added and clipped,
+then images are converted back. Thus model-space alpha `8/255` has
+pixel-space RMS `4/255`.
+
+The selected checkpoint can be used directly instead of the `.npy` file:
+
+```bash
+python hacking/apply_fourier_pattern.py \
+  --input_dir /path/to/input_images \
+  --output_dir /path/to/patched_images \
+  --pattern \
+  work_dirs/pMF_universal_pattern/pMF_B_256-fourier-overfit50k/checkpoints/fourier_pattern_overfit_selected.pth \
+  --alpha 0.0313725490196
+```
+
+Overfit training and evaluation use phase `(0,0)`, which is also the
+application default. Existing outputs are protected unless `--overwrite` is
+passed. Each output directory includes `apply_pattern_manifest.json` with the
+pattern, alpha, phase, and image count.
+
+Use `--random_sample 10 --sample_seed 2026` to apply the pattern to a
+reproducible random subset of ten images. The selected relative paths are
+recorded in the output manifest.
