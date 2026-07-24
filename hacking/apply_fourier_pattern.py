@@ -21,8 +21,6 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
-from utils.data_util import center_crop_arr
-
 
 IMAGE_SUFFIXES = {
     ".bmp",
@@ -33,6 +31,32 @@ IMAGE_SUFFIXES = {
     ".tiff",
     ".webp",
 }
+
+
+def _center_crop_arr(
+    image: Image.Image,
+    image_size: int,
+) -> Image.Image:
+    """ADM-style resize of the short side followed by a center crop."""
+    while min(*image.size) >= 2 * image_size:
+        image = image.resize(
+            tuple(size // 2 for size in image.size),
+            resample=Image.Resampling.BOX,
+        )
+    scale = image_size / min(*image.size)
+    image = image.resize(
+        tuple(round(size * scale) for size in image.size),
+        resample=Image.Resampling.BICUBIC,
+    )
+    array = np.asarray(image)
+    crop_y = (array.shape[0] - image_size) // 2
+    crop_x = (array.shape[1] - image_size) // 2
+    return Image.fromarray(
+        array[
+            crop_y : crop_y + image_size,
+            crop_x : crop_x + image_size,
+        ]
+    )
 
 
 def _prepare_spatial_pattern(
@@ -214,9 +238,9 @@ def _load_rgb(
             # Match the ADM/ImageNet preprocessing used to compute the
             # repository's reference FID statistics: resize the short side
             # to crop_size, then take a centered square crop.
-            rgb_image = center_crop_arr(rgb_image, crop_size)
+            rgb_image = _center_crop_arr(rgb_image, crop_size)
             if alpha_channel is not None:
-                alpha_channel = center_crop_arr(alpha_channel, crop_size)
+                alpha_channel = _center_crop_arr(alpha_channel, crop_size)
         rgb = np.asarray(rgb_image, dtype=np.float32).copy()
     tensor = torch.from_numpy(rgb).permute(2, 0, 1).div_(255.0)
     return tensor, alpha_channel
