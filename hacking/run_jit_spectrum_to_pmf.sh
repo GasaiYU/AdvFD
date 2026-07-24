@@ -27,6 +27,8 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 : "${GEN_BSZ_PER_GPU:=256}"
 : "${FID_BSZ_PER_GPU:=128}"
 : "${FID_NUM_WORKERS:=8}"
+: "${APPLY_NUM_WORKERS:=16}"
+: "${APPLY_LOG_EVERY:=1000}"
 : "${MASTER_PORT:=29640}"
 
 # Fixed, non-optimized spectrum extraction and application parameters.
@@ -169,12 +171,11 @@ if [[ "$patched_count" -eq "$NUM_IMAGES" ]]; then
     echo "[reuse] patched pMF folder: $PATCHED_DIR"
 else
     apply_args=()
-    if [[ "$OVERWRITE" == "1" ]]; then
+    if [[ "$patched_count" -ne 0 ]]; then
+        echo "[resume] patched folder: ${patched_count}/${NUM_IMAGES}"
+        apply_args+=(--resume)
+    elif [[ "$OVERWRITE" == "1" ]]; then
         apply_args+=(--overwrite)
-    elif [[ "$patched_count" -ne 0 ]]; then
-        echo "[ERR] patched folder is partial: ${patched_count}/${NUM_IMAGES}" >&2
-        echo "[ERR] set OVERWRITE=1 to rewrite the complete derived folder" >&2
-        exit 1
     fi
     python hacking/apply_fourier_pattern.py \
         --input_dir "$PMF_IMAGE_DIR" \
@@ -183,6 +184,8 @@ else
         --alpha "$ALPHA" \
         --alpha_space pixel \
         --preserve_pattern_scale \
+        --num_workers "$APPLY_NUM_WORKERS" \
+        --log_every "$APPLY_LOG_EVERY" \
         --output_format png \
         "${apply_args[@]}"
 fi
@@ -236,6 +239,8 @@ if [[ ! -f "${VIS_DIR}/apply_pattern_manifest.json" || "$OVERWRITE" == "1" ]]; t
         --alpha "$ALPHA" \
         --alpha_space pixel \
         --preserve_pattern_scale \
+        --num_workers "$APPLY_NUM_WORKERS" \
+        --log_every "$APPLY_LOG_EVERY" \
         --output_format png \
         --random_sample "$VIS_IMAGES" \
         --sample_seed "$VIS_SEED" \

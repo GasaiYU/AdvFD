@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -9,7 +11,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from hacking.apply_fourier_pattern import load_spatial_pattern
+from hacking.apply_fourier_pattern import (
+    get_args_parser as get_apply_args_parser,
+    load_spatial_pattern,
+    main as apply_main,
+)
 from hacking.extract_spectral_pattern import (
     decode_cache_images,
     discover_cache,
@@ -80,6 +86,67 @@ def _write_synthetic_cache(
 
 
 class SpectralPatternTest(unittest.TestCase):
+    def test_parallel_pattern_application_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            generator = np.random.default_rng(31)
+            for index in range(12):
+                image = generator.integers(
+                    0, 256, size=(16, 16, 3), dtype=np.uint8
+                )
+                Image.fromarray(image).save(
+                    input_dir / f"{index:06d}.png"
+                )
+            pattern = generator.normal(
+                0.0, 0.02, size=(3, 16, 16)
+            ).astype(np.float32)
+            pattern_path = root / "pattern.npy"
+            np.save(pattern_path, pattern)
+
+            base_arguments = [
+                "--input_dir",
+                str(input_dir),
+                "--output_dir",
+                str(output_dir),
+                "--pattern",
+                str(pattern_path),
+                "--alpha",
+                "0.2",
+                "--alpha_space",
+                "pixel",
+                "--preserve_pattern_scale",
+                "--output_format",
+                "png",
+                "--num_workers",
+                "4",
+                "--log_every",
+                "5",
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                apply_main(
+                    get_apply_args_parser().parse_args(base_arguments)
+                )
+            outputs = sorted(output_dir.glob("*.png"))
+            self.assertEqual(len(outputs), 12)
+            outputs[3].unlink()
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                apply_main(
+                    get_apply_args_parser().parse_args(
+                        [*base_arguments, "--resume"]
+                    )
+                )
+            with (
+                output_dir / "apply_pattern_manifest.json"
+            ).open() as handle:
+                manifest = json.load(handle)
+            self.assertEqual(manifest["processed_this_run"], 1)
+            self.assertEqual(manifest["resumed_existing"], 11)
+            self.assertEqual(len(list(output_dir.glob("*.png"))), 12)
+
     def test_flat_image_directory_matches_uint8_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

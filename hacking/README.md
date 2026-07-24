@@ -276,3 +276,8 @@ when intentionally overriding one of them, for example:
 ```bash
 ALPHA=2.0 bash hacking/run_jit_spectrum_to_pmf.sh
 ```
+
+Pattern application uses 16 parallel image workers by default. Override it
+for a different CPU/storage configuration with `APPLY_NUM_WORKERS`. A
+partially written alpha directory is resumed automatically instead of
+reprocessing completed PNG files.

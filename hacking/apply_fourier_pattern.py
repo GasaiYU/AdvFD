@@ -9,6 +9,7 @@ export or a Fourier pattern checkpoint produced by
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import random
@@ -211,7 +212,7 @@ def _save_image(
         .cpu()
         .numpy()
     )
-    output = Image.fromarray(array, mode="RGB")
+    output = Image.fromarray(array)
     if alpha_channel is not None and destination.suffix.lower() in {
         ".png",
         ".tif",
@@ -274,6 +275,23 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.set_defaults(recursive=True)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip output images that already exist",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="parallel image decode/encode workers",
+    )
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=1000,
+        help="print progress every N newly processed images",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=0,
@@ -320,6 +338,16 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("--random_sample must be non-negative")
     if args.limit and args.random_sample:
         raise ValueError("--limit and --random_sample are mutually exclusive")
+    if args.overwrite and args.resume:
+        raise ValueError("--overwrite and --resume are mutually exclusive")
+    if args.num_workers < 1:
+        raise ValueError("--num_workers must be positive")
+    if args.log_every < 1:
+        raise ValueError("--log_every must be positive")
+    if args.num_workers > 1:
+        # Each image operation is small. Avoid nesting PyTorch's CPU thread
+        # pool inside the outer image-level worker pool.
+        torch.set_num_threads(1)
 
     pattern_path = Path(args.pattern).expanduser().resolve()
     pattern = load_spatial_pattern(
@@ -358,12 +386,22 @@ def main(args: argparse.Namespace) -> None:
             "--output_format preserve"
         )
     existing = [path for path in destinations if path.exists()]
-    if existing and not args.overwrite:
+    if existing and not args.overwrite and not args.resume:
         preview = "\n".join(str(path) for path in existing[:5])
         raise FileExistsError(
             f"{len(existing)} output files already exist. Pass --overwrite "
-            f"to replace them. First paths:\n{preview}"
+            f"to replace them or --resume to skip them. First paths:\n"
+            f"{preview}"
         )
+    if args.resume:
+        pending = [
+            (source, destination)
+            for source, destination in zip(sources, destinations)
+            if not destination.exists()
+        ]
+    else:
+        pending = list(zip(sources, destinations))
+    resumed_existing = len(sources) - len(pending)
 
     print(
         f"pattern={pattern_path} shape={tuple(pattern.shape)} "
@@ -377,15 +415,17 @@ def main(args: argparse.Namespace) -> None:
         else args.alpha
     )
     print(
-        f"images={len(sources)} alpha={args.alpha:.10g} "
+        f"images={len(sources)} pending={len(pending)} "
+        f"workers={args.num_workers} alpha={args.alpha:.10g} "
         f"alpha_space={args.alpha_space} "
         f"effective_pixel_rms={effective_pixel_rms:.10g} "
         f"phase=({args.shift_y},{args.shift_x})"
     )
 
-    for index, (source, destination) in enumerate(
-        zip(sources, destinations), start=1
-    ):
+    def process_one(
+        item: tuple[Path, Path],
+    ) -> None:
+        source, destination = item
         image, alpha_channel = _load_rgb(source)
         patched = apply_pattern(
             image,
@@ -401,8 +441,35 @@ def main(args: argparse.Namespace) -> None:
             alpha_channel,
             jpeg_quality=args.jpeg_quality,
         )
-        if index % 100 == 0 or index == len(sources):
-            print(f"processed {index}/{len(sources)}")
+
+    if args.num_workers == 1:
+        results = map(process_one, pending)
+        for index, _ in enumerate(results, start=1):
+            if index % args.log_every == 0 or index == len(pending):
+                print(
+                    f"processed {index}/{len(pending)} pending images "
+                    f"(total complete={resumed_existing + index}/"
+                    f"{len(sources)})"
+                )
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=args.num_workers
+        ) as executor:
+            results = executor.map(process_one, pending)
+            for index, _ in enumerate(results, start=1):
+                if index % args.log_every == 0 or index == len(pending):
+                    print(
+                        f"processed {index}/{len(pending)} pending images "
+                        f"(total complete={resumed_existing + index}/"
+                        f"{len(sources)})"
+                    )
+
+    missing = [path for path in destinations if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} expected output images are missing; "
+            f"first path: {missing[0]}"
+        )
 
     manifest = {
         "input_dir": str(input_dir),
@@ -419,6 +486,9 @@ def main(args: argparse.Namespace) -> None:
         "shift_x": args.shift_x,
         "num_images": len(sources),
         "num_discovered_images": discovered_images,
+        "processed_this_run": len(pending),
+        "resumed_existing": resumed_existing,
+        "num_workers": args.num_workers,
         "random_sample": args.random_sample,
         "sample_seed": args.sample_seed if args.random_sample else None,
         "selected_images": [
