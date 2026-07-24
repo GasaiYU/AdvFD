@@ -344,6 +344,15 @@ def get_args_parser() -> argparse.ArgumentParser:
         choices=["preserve", "png"],
         default="preserve",
     )
+    parser.add_argument(
+        "--side_by_side",
+        action="store_true",
+        help=(
+            "save one visualization with the cropped original on the left "
+            "and the patched image on the right; do not use these composite "
+            "images for FID evaluation"
+        ),
+    )
     parser.add_argument("--jpeg_quality", type=int, default=95)
     parser.add_argument(
         "--no_recursive",
@@ -517,6 +526,7 @@ def main(args: argparse.Namespace) -> None:
         f"alpha_space={args.alpha_space} "
         f"effective_pixel_rms={effective_pixel_rms:.10g} "
         f"crop_size={args.crop_size} "
+        f"side_by_side={args.side_by_side} "
         f"phase=({args.shift_y},{args.shift_x})"
     )
 
@@ -536,10 +546,24 @@ def main(args: argparse.Namespace) -> None:
             shift_y=args.shift_y,
             shift_x=args.shift_x,
         )
+        output_image = (
+            torch.cat((image, patched), dim=-1)
+            if args.side_by_side
+            else patched
+        )
+        output_alpha = (
+            Image.new(
+                "L",
+                (alpha_channel.width * 2, alpha_channel.height),
+                color=255,
+            )
+            if args.side_by_side and alpha_channel is not None
+            else alpha_channel
+        )
         _save_image(
-            patched,
+            output_image,
             destination,
-            alpha_channel,
+            output_alpha,
             jpeg_quality=args.jpeg_quality,
         )
 
@@ -584,6 +608,12 @@ def main(args: argparse.Namespace) -> None:
         "alpha_space": args.alpha_space,
         "effective_pixel_rms": effective_pixel_rms,
         "crop_size": args.crop_size,
+        "side_by_side": args.side_by_side,
+        "side_by_side_layout": (
+            "original_left_patched_right"
+            if args.side_by_side
+            else None
+        ),
         "shift_y": args.shift_y,
         "shift_x": args.shift_x,
         "num_images": len(sources),

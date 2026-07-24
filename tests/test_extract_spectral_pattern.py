@@ -162,6 +162,7 @@ class SpectralPatternTest(unittest.TestCase):
                 "4",
                 "--log_every",
                 "5",
+                "--side_by_side",
             ]
             with contextlib.redirect_stdout(io.StringIO()):
                 apply_main(
@@ -185,10 +186,15 @@ class SpectralPatternTest(unittest.TestCase):
             self.assertEqual(manifest["resumed_existing"], 11)
             self.assertEqual(manifest["repaired_invalid_images"], 1)
             self.assertEqual(manifest["crop_size"], 256)
+            self.assertTrue(manifest["side_by_side"])
+            self.assertEqual(
+                manifest["side_by_side_layout"],
+                "original_left_patched_right",
+            )
             self.assertEqual(len(list(output_dir.glob("*.png"))), 12)
             with Image.open(outputs[3]) as repaired:
                 repaired.load()
-                self.assertEqual(repaired.size, (256, 256))
+                self.assertEqual(repaired.size, (512, 256))
 
     def test_flat_image_directory_matches_uint8_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
