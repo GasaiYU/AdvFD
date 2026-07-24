@@ -27,6 +27,7 @@ __pycache__/
 .pyright/
 .ruff_cache/
 .ipynb_checkpoints/
+.superpowers/
 
 # Environments and build products
 .env
