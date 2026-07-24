@@ -111,6 +111,25 @@ def _checkpoint_identity(path: str) -> dict[str, object]:
 
 
 def _cache_spec(args: argparse.Namespace) -> dict[str, object]:
+    splits: dict[str, dict[str, int]] = {
+        "optimization": {
+            "images": args.hack_optimization_images,
+            "seed": args.hack_optimization_seed,
+        },
+    }
+    if not args.hack_overfit_only:
+        splits.update(
+            {
+                "validation": {
+                    "images": args.hack_validation_images,
+                    "seed": args.hack_validation_seed,
+                },
+                "test": {
+                    "images": args.hack_test_images,
+                    "seed": args.hack_test_seed,
+                },
+            }
+        )
     return {
         "version": CACHE_VERSION,
         "checkpoint": _checkpoint_identity(args.load_from),
@@ -127,20 +146,8 @@ def _cache_spec(args: argparse.Namespace) -> dict[str, object]:
         "num_classes": args.num_classes,
         "world_size": get_world_size(),
         "cache_dtype": args.hack_cache_dtype,
-        "splits": {
-            "optimization": {
-                "images": args.hack_optimization_images,
-                "seed": args.hack_optimization_seed,
-            },
-            "validation": {
-                "images": args.hack_validation_images,
-                "seed": args.hack_validation_seed,
-            },
-            "test": {
-                "images": args.hack_test_images,
-                "seed": args.hack_test_seed,
-            },
-        },
+        "overfit_only": args.hack_overfit_only,
+        "splits": splits,
     }
 
 
@@ -291,8 +298,11 @@ def _ensure_image_cache(args: argparse.Namespace) -> Path:
     manifest_path = cache_root / "manifest.json"
     spec = _cache_spec(args)
     fingerprint = _fingerprint(spec)
+    split_specs = spec["splits"]
+    assert isinstance(split_specs, dict)
 
     manifest_matches = False
+    manifest: dict[str, object] = {}
     if manifest_path.exists():
         try:
             with manifest_path.open() as handle:
@@ -303,6 +313,54 @@ def _ensure_image_cache(args: argparse.Namespace) -> Path:
             )
         except (OSError, json.JSONDecodeError):
             manifest_matches = False
+
+    # An overfit-only run needs just the optimization shard. Reuse that shard
+    # from a compatible full optimization/validation/test cache instead of
+    # forcing another 50k generator pass merely because the manifest is a
+    # strict superset.
+    if (
+        args.hack_overfit_only
+        and manifest_path.exists()
+        and not manifest_matches
+        and not args.hack_overwrite_cache
+    ):
+        existing_spec = manifest.get("spec")
+        existing_fingerprint = manifest.get("fingerprint")
+        if isinstance(existing_spec, dict) and isinstance(
+            existing_fingerprint, str
+        ):
+            requested_core = {
+                key: value
+                for key, value in spec.items()
+                if key not in {"overfit_only", "splits"}
+            }
+            existing_core = {
+                key: value
+                for key, value in existing_spec.items()
+                if key not in {"overfit_only", "splits"}
+            }
+            existing_splits = existing_spec.get("splits")
+            requested_optimization = split_specs.get("optimization")
+            existing_optimization = (
+                existing_splits.get("optimization")
+                if isinstance(existing_splits, dict)
+                else None
+            )
+            if (
+                requested_core == existing_core
+                and requested_optimization == existing_optimization
+            ):
+                spec = existing_spec
+                fingerprint = existing_fingerprint
+                split_specs = {
+                    "optimization": existing_optimization
+                }
+                manifest_matches = True
+                logger.info(
+                    "Reusing optimization shard from compatible full cache: %s",
+                    cache_root,
+                )
+
     if manifest_path.exists() and not manifest_matches:
         if not args.hack_overwrite_cache:
             raise ValueError(
@@ -312,8 +370,6 @@ def _ensure_image_cache(args: argparse.Namespace) -> Path:
             )
         logger.warning("Cache manifest mismatch; rewriting this run's shards")
 
-    split_specs = spec["splits"]
-    assert isinstance(split_specs, dict)
     missing: list[str] = []
     for split, split_spec in split_specs.items():
         assert isinstance(split_spec, dict)
@@ -1135,6 +1191,386 @@ def _optimize_pattern(
     }
 
 
+def _clone_pattern_state(
+    pattern: FourierPattern,
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value.detach().clone()
+        for key, value in pattern.state_dict().items()
+    }
+
+
+def _overfit_pattern(
+    args: argparse.Namespace,
+    inception: nn.Module,
+    pattern: FourierPattern,
+    cache_root: Path,
+    wandb_logger=None,
+) -> dict[str, object]:
+    """Fit and select exclusively on the same fixed 50k image cache."""
+    split = CachedImageSplit(cache_root, "optimization")
+    optimization_images = split.load_all()
+    mu_ref, sigma_ref = load_mu_and_sigma_reference(args.fid_stats_path)
+    sigma_ref_sqrt = (
+        precompute_sigma_ref_sqrt(sigma_ref)
+        if args.fd_eigvalsh
+        else None
+    )
+    reference = np.load(args.fid_stats_path)
+    ref_mu = np.asarray(reference["mu"], dtype=np.float64)
+    ref_sigma = np.asarray(reference["sigma"], dtype=np.float64)
+    history: list[dict[str, object]] = []
+
+    pattern.coeff.data.zero_()
+    baseline_fid = _cached_inception_fd(
+        args,
+        inception,
+        pattern,
+        split,
+        ref_mu,
+        ref_sigma,
+        alpha=args.hack_train_alpha,
+    )
+    best_fid = baseline_fid
+    best_state = _clone_pattern_state(pattern)
+    best_stage = "zero"
+    best_step = 0
+    history.append(
+        {
+            "step": 0,
+            "stage": "zero",
+            "fid": baseline_fid,
+            "delta_from_baseline": 0.0,
+            "step_size": 0.0,
+            "accepted": True,
+        }
+    )
+    _save_pattern_checkpoint(
+        args,
+        pattern,
+        name="fourier_pattern_overfit_best.pth",
+        stage=best_stage,
+        step=best_step,
+        validation_fid=best_fid,
+        validation_baseline_fid=baseline_fid,
+    )
+
+    # The local derivative only fixes an orientation.  Since RMS
+    # normalization turns it into a finite perturbation, evaluate both signs
+    # on the same overfit set before starting iterative refinement.
+    zero_joint_fid, zero_gradient = _full_cached_fd_gradient(
+        args,
+        inception,
+        pattern,
+        optimization_images,
+        mu_ref,
+        sigma_ref,
+        sigma_ref_sqrt,
+        phase_round=0,
+        normalize_pattern=False,
+    )
+    zero_gradient_rms = float(
+        zero_gradient.square().mean().sqrt().item()
+    )
+    if not math.isfinite(zero_gradient_rms) or zero_gradient_rms <= 0:
+        raise FloatingPointError(
+            f"Invalid zero-pattern gradient RMS: {zero_gradient_rms}"
+        )
+
+    with torch.no_grad():
+        pattern.coeff.copy_(
+            -zero_gradient
+            / zero_gradient.square().mean().add(1e-12).sqrt()
+        )
+        pattern.normalize_coefficients_()
+    descent_fid = _cached_inception_fd(
+        args,
+        inception,
+        pattern,
+        split,
+        ref_mu,
+        ref_sigma,
+        alpha=args.hack_train_alpha,
+    )
+    descent_state = _clone_pattern_state(pattern)
+    history.append(
+        {
+            "step": 0,
+            "stage": "negative_gradient",
+            "fid": descent_fid,
+            "delta_from_baseline": descent_fid - baseline_fid,
+            "step_size": 0.0,
+            "accepted": False,
+        }
+    )
+
+    with torch.no_grad():
+        pattern.coeff.mul_(-1.0)
+    opposite_fid = _cached_inception_fd(
+        args,
+        inception,
+        pattern,
+        split,
+        ref_mu,
+        ref_sigma,
+        alpha=args.hack_train_alpha,
+    )
+    opposite_state = _clone_pattern_state(pattern)
+    history.append(
+        {
+            "step": 0,
+            "stage": "positive_gradient",
+            "fid": opposite_fid,
+            "delta_from_baseline": opposite_fid - baseline_fid,
+            "step_size": 0.0,
+            "accepted": False,
+        }
+    )
+
+    if descent_fid <= opposite_fid:
+        pattern.load_state_dict(descent_state)
+        current_fid = descent_fid
+        current_stage = "negative_gradient"
+    else:
+        pattern.load_state_dict(opposite_state)
+        current_fid = opposite_fid
+        current_stage = "positive_gradient"
+    for row in history[-2:]:
+        row["accepted"] = row["stage"] == current_stage
+
+    if current_fid < best_fid:
+        best_fid = current_fid
+        best_state = _clone_pattern_state(pattern)
+        best_stage = current_stage
+        _save_pattern_checkpoint(
+            args,
+            pattern,
+            name="fourier_pattern_overfit_best.pth",
+            stage=best_stage,
+            step=0,
+            validation_fid=best_fid,
+            validation_baseline_fid=baseline_fid,
+        )
+    logger.info(
+        "[overfit] baseline=%.6f joint_zero_fid=%.6f "
+        "negative_gradient=%.6f positive_gradient=%.6f selected=%s",
+        baseline_fid,
+        zero_joint_fid,
+        descent_fid,
+        opposite_fid,
+        current_stage,
+    )
+
+    completed_steps = 0
+    for step in range(1, args.hack_pgd_steps + 1):
+        joint_fid, gradient = _full_cached_fd_gradient(
+            args,
+            inception,
+            pattern,
+            optimization_images,
+            mu_ref,
+            sigma_ref,
+            sigma_ref_sqrt,
+            phase_round=0,
+            normalize_pattern=True,
+        )
+        gradient_rms = gradient.square().mean().add(1e-12).sqrt()
+        origin_state = _clone_pattern_state(pattern)
+        accepted = False
+        step_size = args.hack_pgd_step_size
+        candidate_fid = math.inf
+        used_backtracks = 0
+
+        for backtrack in range(args.hack_overfit_backtracks + 1):
+            pattern.load_state_dict(origin_state)
+            with torch.no_grad():
+                pattern.coeff.add_(
+                    gradient / gradient_rms,
+                    alpha=-step_size,
+                )
+                pattern.normalize_coefficients_()
+            candidate_fid = _cached_inception_fd(
+                args,
+                inception,
+                pattern,
+                split,
+                ref_mu,
+                ref_sigma,
+                alpha=args.hack_train_alpha,
+            )
+            history.append(
+                {
+                    "step": step,
+                    "stage": f"pgd_backtrack_{backtrack}",
+                    "fid": candidate_fid,
+                    "delta_from_baseline": candidate_fid - baseline_fid,
+                    "step_size": step_size,
+                    "accepted": candidate_fid
+                    < current_fid
+                    - args.hack_min_validation_improvement,
+                    "joint_fid_before_update": joint_fid,
+                    "gradient_rms": float(gradient_rms.item()),
+                }
+            )
+            if (
+                candidate_fid
+                < current_fid - args.hack_min_validation_improvement
+            ):
+                accepted = True
+                used_backtracks = backtrack
+                break
+            step_size *= args.hack_overfit_backtrack_factor
+
+        if not accepted:
+            pattern.load_state_dict(origin_state)
+            logger.info(
+                "[overfit] step=%d found no decreasing update after %d "
+                "backtracks; stopping at FID=%.6f",
+                step,
+                args.hack_overfit_backtracks,
+                current_fid,
+            )
+            break
+
+        current_fid = candidate_fid
+        completed_steps = step
+        if current_fid < best_fid:
+            best_fid = current_fid
+            best_state = _clone_pattern_state(pattern)
+            best_stage = "pgd"
+            best_step = step
+            _save_pattern_checkpoint(
+                args,
+                pattern,
+                name="fourier_pattern_overfit_best.pth",
+                stage=best_stage,
+                step=best_step,
+                validation_fid=best_fid,
+                validation_baseline_fid=baseline_fid,
+            )
+        logger.info(
+            "[overfit] step=%d/%d FID %.6f -> %.6f "
+            "step_size=%.6g backtracks=%d best=%.6f",
+            step,
+            args.hack_pgd_steps,
+            joint_fid,
+            current_fid,
+            step_size,
+            used_backtracks,
+            best_fid,
+        )
+        if wandb_logger is not None:
+            wandb_logger.update(
+                {
+                    "hack_overfit/fid": current_fid,
+                    "hack_overfit/best_fid": best_fid,
+                    "hack_overfit/delta": current_fid - baseline_fid,
+                    "hack_overfit/step_size": step_size,
+                    "hack_overfit/backtracks": used_backtracks,
+                },
+                step=step,
+            )
+
+    pattern.load_state_dict(best_state)
+    _save_pattern_checkpoint(
+        args,
+        pattern,
+        name="fourier_pattern_overfit_selected.pth",
+        stage=best_stage,
+        step=best_step,
+        validation_fid=best_fid,
+        validation_baseline_fid=baseline_fid,
+    )
+
+    dose_rows: list[dict[str, float | int]] = []
+    dose_values: list[float] = []
+    for alpha in args.hack_eval_alphas:
+        value = _cached_inception_fd(
+            args,
+            inception,
+            pattern,
+            split,
+            ref_mu,
+            ref_sigma,
+            alpha=alpha,
+        )
+        dose_values.append(value)
+        dose_rows.append(
+            {
+                "alpha": alpha,
+                "inception_fid": value,
+                "num_images": args.hack_optimization_images,
+            }
+        )
+        logger.info(
+            "[overfit dose] alpha=%.8f inception_fid=%.6f",
+            alpha,
+            value,
+        )
+    beta_inception = _linear_slope(
+        list(args.hack_eval_alphas), dose_values
+    )
+    summary: dict[str, object] = {
+        "mode": "overfit_only",
+        "optimization_images": args.hack_optimization_images,
+        "optimization_seed": args.hack_optimization_seed,
+        "train_alpha": args.hack_train_alpha,
+        "baseline_fid": baseline_fid,
+        "best_fid": best_fid,
+        "best_delta": best_fid - baseline_fid,
+        "fit_success": best_fid < baseline_fid,
+        "selected_stage": best_stage,
+        "selected_step": best_step,
+        "completed_pgd_steps": completed_steps,
+        "zero_gradient_rms": zero_gradient_rms,
+        "negative_gradient_fid": descent_fid,
+        "positive_gradient_fid": opposite_fid,
+        "alphas": list(args.hack_eval_alphas),
+        "dose_response_beta_inception": beta_inception,
+        "dose_response_success": beta_inception < 0,
+        "random_phase": args.hack_random_phase,
+    }
+    if get_global_rank() == 0:
+        history_path = Path(args.log_dir) / "overfit_history.csv"
+        history_fields: list[str] = []
+        for row in history:
+            for key in row:
+                if key not in history_fields:
+                    history_fields.append(key)
+        with history_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=history_fields)
+            writer.writeheader()
+            writer.writerows(history)
+        dose_path = Path(args.log_dir) / "overfit_dose_response.csv"
+        with dose_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["alpha", "inception_fid", "num_images"],
+            )
+            writer.writeheader()
+            writer.writerows(dose_rows)
+        summary_path = Path(args.log_dir) / "overfit_summary.json"
+        with summary_path.open("w") as handle:
+            json.dump(summary, handle, indent=2)
+        logger.info("Overfit history: %s", history_path)
+        logger.info("Overfit dose response: %s", dose_path)
+        logger.info("Overfit summary: %s", summary_path)
+        logger.info(
+            "[overfit result] baseline=%.6f best=%.6f delta=%+.6f "
+            "beta_inc=%.6g fit_success=%s dose_success=%s",
+            baseline_fid,
+            best_fid,
+            best_fid - baseline_fid,
+            beta_inception,
+            summary["fit_success"],
+            summary["dose_response_success"],
+        )
+
+    del optimization_images, mu_ref, sigma_ref, sigma_ref_sqrt
+    torch.cuda.empty_cache()
+    return summary
+
+
 def _empty_eval_totals(
     metric_dims: dict[str, int],
     alphas: list[float],
@@ -1433,9 +1869,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--load_from is required")
     expected_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     split_counts = (
-        args.hack_optimization_images,
-        args.hack_validation_images,
-        args.hack_test_images,
+        (args.hack_optimization_images,)
+        if args.hack_overfit_only
+        else (
+            args.hack_optimization_images,
+            args.hack_validation_images,
+            args.hack_test_images,
+        )
     )
     if any(count < 2 or count % expected_world_size for count in split_counts):
         raise ValueError(
@@ -1481,16 +1921,17 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if args.hack_eval_blocks < 1:
         raise ValueError("--hack_eval_blocks must be positive")
-    if args.hack_test_images % args.hack_eval_blocks:
-        raise ValueError(
-            "--hack_test_images must be divisible by --hack_eval_blocks"
-        )
-    if (
-        args.hack_test_images // expected_world_size
-    ) % args.hack_eval_blocks:
-        raise ValueError(
-            "Each rank's test shard must divide evenly into eval blocks"
-        )
+    if not args.hack_overfit_only:
+        if args.hack_test_images % args.hack_eval_blocks:
+            raise ValueError(
+                "--hack_test_images must be divisible by --hack_eval_blocks"
+            )
+        if (
+            args.hack_test_images // expected_world_size
+        ) % args.hack_eval_blocks:
+            raise ValueError(
+                "Each rank's test shard must divide evenly into eval blocks"
+            )
     if not 0 < args.hack_confidence < 1:
         raise ValueError("--hack_confidence must be in (0,1)")
     if args.hack_clip_fdr_denominator <= 0:
@@ -1500,6 +1941,16 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.hack_cache_only and args.hack_eval_only:
         raise ValueError(
             "--hack_cache_only and --hack_eval_only are mutually exclusive"
+        )
+    if args.hack_overfit_only and args.hack_eval_only:
+        raise ValueError(
+            "--hack_overfit_only and --hack_eval_only are mutually exclusive"
+        )
+    if args.hack_overfit_backtracks < 0:
+        raise ValueError("--hack_overfit_backtracks must be non-negative")
+    if not 0 < args.hack_overfit_backtrack_factor < 1:
+        raise ValueError(
+            "--hack_overfit_backtrack_factor must be in (0,1)"
         )
 
 
@@ -1607,6 +2058,25 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hack_confidence", type=float, default=0.95)
     parser.add_argument("--hack_cache_only", action="store_true")
     parser.add_argument("--hack_eval_only", action="store_true")
+    parser.add_argument(
+        "--hack_overfit_only",
+        action="store_true",
+        help=(
+            "use only the fixed optimization split for fitting, checkpoint "
+            "selection, and Inception dose-response debugging"
+        ),
+    )
+    parser.add_argument(
+        "--hack_overfit_backtracks",
+        type=int,
+        default=5,
+        help="maximum PGD step halvings on the same 50k optimization set",
+    )
+    parser.add_argument(
+        "--hack_overfit_backtrack_factor",
+        type=float,
+        default=0.5,
+    )
     parser.add_argument("--hack_skip_final_eval", action="store_true")
     parser.add_argument("--hack_pattern_checkpoint", type=str, default=None)
     return parser
@@ -1615,6 +2085,11 @@ def get_args_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> dict[str, object]:
     from utils.setup_util import setup
 
+    if args.hack_overfit_only:
+        # A strict overfit/debug run must optimize and evaluate the identical
+        # transformation. Random phase belongs to the later generalization
+        # experiment, not this optimizer sanity check.
+        args.hack_random_phase = False
     _validate_args(args)
     wandb_logger = setup(args)
     cache_root = _ensure_image_cache(args)
@@ -1646,6 +2121,30 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     )
 
     optimization_summary: dict[str, object]
+    if args.hack_overfit_only:
+        optimization_summary = _overfit_pattern(
+            args,
+            inception,
+            pattern,
+            cache_root,
+            wandb_logger=wandb_logger,
+        )
+        _save_pattern_preview(args, pattern)
+        if wandb_logger is not None and get_global_rank() == 0:
+            wandb_logger.update(
+                {
+                    f"hack_overfit/final_{key}": value
+                    for key, value in optimization_summary.items()
+                    if isinstance(value, (int, float, bool))
+                },
+                step=int(
+                    optimization_summary.get("selected_step", 0) or 0
+                ),
+            )
+        _barrier()
+        if wandb_logger is not None:
+            wandb_logger.finish()
+        return optimization_summary
     if args.hack_eval_only:
         checkpoint_path = args.hack_pattern_checkpoint
         if checkpoint_path is None:

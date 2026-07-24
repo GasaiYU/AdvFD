@@ -26,7 +26,7 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 : "${OPT_IMAGES:=50000}"
 : "${VAL_IMAGES:=5000}"
 : "${TEST_IMAGES:=50000}"
-: "${PGD_STEPS:=0}"
+: "${PGD_STEPS:=100}"
 : "${CACHE_ROOT:=./work_dirs/hacking_cache}"
 
 TOTAL_GPUS=$(( NNODES * GPUS_PER_NODE ))
@@ -82,6 +82,8 @@ case "${MODEL_SIZE}-${RES}" in
         exit 1 ;;
 esac
 
+: "${EXP_NAME:=${MODEL}_${RES}-cached-fourier-inception}"
+
 torchrun \
     --nnodes="$NNODES" \
     --node_rank="$NODE_RANK" \
@@ -90,7 +92,7 @@ torchrun \
     --nproc_per_node="$GPUS_PER_NODE" \
     hacking/pmf_fourier_universal.py \
     --project pMF_universal_pattern \
-    --exp_name "${MODEL}_${RES}-cached-fourier-inception" \
+    --exp_name "$EXP_NAME" \
     --load_from "$LOAD" \
     --model "$MODEL" --rope_2d --learned_pe --disable_v_head \
     --cfg "$CFG" --interval_min "$INTERVAL_MIN" --interval_max "$INTERVAL_MAX" \

@@ -58,6 +58,24 @@ so large PGD step counts are intentionally not the default.
 
 ## Useful modes
 
+Strictly overfit one fixed 50k set, with no validation/test split and no CLIP:
+
+```bash
+EXP_NAME=pMF_B_256-fourier-overfit50k \
+PGD_STEPS=5 \
+bash hacking/run_pmf_fourier_universal.sh \
+  --hack_overfit_only
+```
+
+This mode disables random phase automatically, evaluates both signs of the
+one-shot direction, and uses the same 50k Inception FID for optimization,
+backtracking, checkpoint selection, and the final dose response. It writes
+`overfit_history.csv`, `overfit_dose_response.csv`, and
+`overfit_summary.json`. The result is an optimizer/debug sanity check only;
+it is not evidence of held-out generalization. If a compatible full
+50k/5k/50k cache already exists, its optimization shard is reused. Otherwise
+the mode creates only the 50k optimization cache.
+
 Generate/verify the three caches and stop:
 
 ```bash
