@@ -167,9 +167,14 @@ prepare_generated_folder \
 
 # Stage 4: add the exact same full-resolution pattern to all 50k pMF images.
 patched_count="$(count_pngs "$PATCHED_DIR")"
+if [[ "$patched_count" -gt "$NUM_IMAGES" ]]; then
+    echo "[ERR] patched folder contains too many PNGs: ${patched_count}/${NUM_IMAGES}" >&2
+    exit 1
+fi
 if [[ "$patched_count" -eq "$NUM_IMAGES" ]]; then
-    echo "[reuse] patched pMF folder: $PATCHED_DIR"
-else
+    echo "[verify] complete patched folder before FID: $PATCHED_DIR"
+fi
+if [[ "$patched_count" -le "$NUM_IMAGES" ]]; then
     apply_args=()
     if [[ "$patched_count" -ne 0 ]]; then
         echo "[resume] patched folder: ${patched_count}/${NUM_IMAGES}"

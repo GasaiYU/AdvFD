@@ -12,7 +12,9 @@ import argparse
 import concurrent.futures
 import json
 import math
+import os
 import random
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -224,7 +226,26 @@ def _save_image(
     save_kwargs: dict[str, object] = {}
     if destination.suffix.lower() in {".jpg", ".jpeg"}:
         save_kwargs.update(quality=jpeg_quality, subsampling=0)
-    output.save(destination, **save_kwargs)
+    temporary = destination.with_name(
+        f".{destination.stem}.tmp-{os.getpid()}-"
+        f"{threading.get_ident()}{destination.suffix}"
+    )
+    try:
+        output.save(temporary, **save_kwargs)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _is_valid_image(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except (OSError, SyntaxError, ValueError):
+        return False
+    return True
 
 
 def get_args_parser() -> argparse.ArgumentParser:
@@ -394,13 +415,28 @@ def main(args: argparse.Namespace) -> None:
             f"{preview}"
         )
     if args.resume:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=args.num_workers
+        ) as executor:
+            valid_outputs = list(
+                executor.map(_is_valid_image, destinations)
+            )
         pending = [
             (source, destination)
-            for source, destination in zip(sources, destinations)
-            if not destination.exists()
+            for source, destination, valid in zip(
+                sources, destinations, valid_outputs
+            )
+            if not valid
         ]
+        invalid_existing = sum(
+            destination.exists() and not valid
+            for destination, valid in zip(
+                destinations, valid_outputs
+            )
+        )
     else:
         pending = list(zip(sources, destinations))
+        invalid_existing = 0
     resumed_existing = len(sources) - len(pending)
 
     print(
@@ -416,6 +452,7 @@ def main(args: argparse.Namespace) -> None:
     )
     print(
         f"images={len(sources)} pending={len(pending)} "
+        f"invalid_existing={invalid_existing} "
         f"workers={args.num_workers} alpha={args.alpha:.10g} "
         f"alpha_space={args.alpha_space} "
         f"effective_pixel_rms={effective_pixel_rms:.10g} "
@@ -488,6 +525,7 @@ def main(args: argparse.Namespace) -> None:
         "num_discovered_images": discovered_images,
         "processed_this_run": len(pending),
         "resumed_existing": resumed_existing,
+        "repaired_invalid_images": invalid_existing,
         "num_workers": args.num_workers,
         "random_sample": args.random_sample,
         "sample_seed": args.sample_seed if args.random_sample else None,
