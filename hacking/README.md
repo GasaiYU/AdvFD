@@ -21,9 +21,10 @@ is controlled only by `alpha`; no `tanh` amplitude warm-up is used.
 Every optimization update uses the complete 50k optimization split. Images are
 streamed in small batches only to control memory. A two-pass sufficient-stat
 gradient first forms the global mean and covariance in float64, differentiates
-FD with respect to those stable statistics, then backpropagates the resulting
-per-feature gradients batch by batch. Consequently this is the gradient of one
-joint 50k-sample FD, not an average of statistically unreliable batch FIDs.
+FD—including the 2048-D covariance square root—in float64, then backpropagates
+the resulting per-feature gradients batch by batch. Consequently this is the
+gradient of one joint 50k-sample FD, not an average of statistically unreliable
+batch FIDs.
 
 ## Default run
 
@@ -108,15 +109,16 @@ cache, enable W&B, and configure all curriculum/PGD hyperparameters. No
 environment variables or pretrained pattern checkpoint are required.
 
 By default it tries
-`8/255, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2`. The first stage learns
-from an exactly zero pattern; later stages initialize only from the preceding
-successful nonzero selection. The initial stage uses 50 PGD steps and later
-stages use 20. It adopts a stage only when that selection beats the zero-pattern
-FID on the fixed 50k set. At the first failed stage it stops and prints the
-strongest successful alpha and checkpoint instead of accidentally continuing
-from the zero fallback. Override `ALPHA_STAGES`, `INITIAL_PGD_STEPS`,
-`PGD_STEPS_PER_STAGE`, or `PGD_STEP_SIZE` through environment variables when a
-finer or more intensive search is needed.
+`0.01, 0.02, 8/255, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2`. The small first
+stage keeps the finite RMS-normalized jump within a useful local-gradient
+regime. It learns from an exactly zero pattern; later stages initialize only
+from the preceding successful nonzero selection. The initial stage uses 50 PGD
+steps and later stages use 20. It adopts a stage only when that selection beats
+the zero-pattern FID on the fixed 50k set. At the first failed stage it stops
+and prints the strongest successful alpha and checkpoint instead of
+accidentally continuing from the zero fallback. Override `ALPHA_STAGES`,
+`INITIAL_PGD_STEPS`, `PGD_STEPS_PER_STAGE`, or `PGD_STEP_SIZE` through
+environment variables when a finer or more intensive search is needed.
 
 Generate/verify the three caches and stop:
 
@@ -165,6 +167,53 @@ Under
 
 CLIP is never used for one-shot direction estimation, PGD, early stopping, or
 checkpoint selection.
+
+## Extract a fixed natural-spectrum pattern without training
+
+Extract the shared high-frequency RGB statistics of the cached low-FID 50k
+pMF images and synthesize one deterministic full-resolution pattern:
+
+```bash
+python hacking/extract_spectral_pattern.py
+```
+
+All defaults are internalized:
+
+```text
+cache:       work_dirs/hacking_cache/pMF_B_256
+split:       optimization
+images:      50000
+blur sigma:  2.0
+seed:        2026
+device:      cuda
+output:      work_dirs/spectral_pattern/pMF_B_256
+```
+
+This is a single-GPU streaming statistic, not a training job: it has no loss,
+backward pass, optimizer, Inception, or CLIP. It reads every rank's existing
+cache shards in deterministic rank/range order, estimates the high-pass RGB
+cross-spectrum, and performs seeded closed-form spectral synthesis.
+
+The main outputs are:
+
+- `spectral_pattern.npy`: exact zero-mean, unit-RMS `3×256×256` pattern;
+- `spectral_pattern.png`: robustly mapped visualization;
+- `spectral_stats.npz`: extracted RGB cross-spectrum and PSD;
+- `radial_psd.csv`: source/pattern radial frequency profiles;
+- `manifest.json`: cache identity, parameters, diagnostics, and hashes.
+
+Apply it with the existing image utility:
+
+```bash
+python hacking/apply_fourier_pattern.py \
+  --input_dir /path/to/input_images \
+  --output_dir hacking/images/spectral_alpha_010 \
+  --pattern work_dirs/spectral_pattern/pMF_B_256/spectral_pattern.npy \
+  --alpha 0.1
+```
+
+Existing extraction outputs are protected. Pass `--overwrite` only when an
+intentional rewrite with the same output directory is required.
 
 ## Apply a selected pattern to images
 

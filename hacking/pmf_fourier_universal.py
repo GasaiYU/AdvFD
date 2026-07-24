@@ -728,16 +728,17 @@ def _full_cached_fd_gradient(
             f"expected {args.hack_optimization_images}"
         )
 
-    # Form centered statistics before the float32 cast. Inception features
-    # have large nonzero means, so casting S/Q first makes Q - SS^T/N lose
-    # enough precision to visibly change the reported joint FID.
+    # Keep the centered statistics and the 2048-D covariance square-root
+    # calculation in float64. Casting either raw S/Q or the resulting
+    # covariance to float32 creates a visible positive FID bias for nearly
+    # singular Inception covariances.
     mu64 = feat_sum / global_count
     sigma64 = (
         feat_outer
         - feat_sum.unsqueeze(1) * feat_sum.unsqueeze(0) / global_count
     ) / (global_count - 1)
-    mu_variable = mu64.float().detach().requires_grad_(True)
-    sigma_variable = sigma64.float().detach().requires_grad_(True)
+    mu_variable = mu64.detach().requires_grad_(True)
+    sigma_variable = sigma64.detach().requires_grad_(True)
     sigma_for_fd = sigma_variable
     if args.hack_cov_eps > 0:
         sigma_for_fd = sigma_for_fd + args.hack_cov_eps * torch.eye(
@@ -1585,6 +1586,19 @@ def _overfit_pattern(
     beta_inception = _linear_slope(
         list(args.hack_eval_alphas), dose_values
     )
+    improvement_tolerance = args.hack_min_validation_improvement
+    alpha_span = (
+        args.hack_eval_alphas[-1] - args.hack_eval_alphas[0]
+    )
+    slope_tolerance = improvement_tolerance / max(alpha_span, 1e-12)
+    dose_best_index = int(np.argmin(dose_values))
+    dose_best_fid = dose_values[dose_best_index]
+    fit_success = best_fid < baseline_fid - improvement_tolerance
+    dose_response_success = (
+        fit_success
+        and dose_best_fid < baseline_fid - improvement_tolerance
+        and beta_inception < -slope_tolerance
+    )
     summary: dict[str, object] = {
         "mode": "overfit_only",
         "optimization_images": args.hack_optimization_images,
@@ -1593,7 +1607,8 @@ def _overfit_pattern(
         "baseline_fid": baseline_fid,
         "best_fid": best_fid,
         "best_delta": best_fid - baseline_fid,
-        "fit_success": best_fid < baseline_fid,
+        "fit_success": fit_success,
+        "success_fid_tolerance": improvement_tolerance,
         "selected_stage": best_stage,
         "selected_step": best_step,
         "completed_pgd_steps": completed_steps,
@@ -1608,7 +1623,12 @@ def _overfit_pattern(
         ),
         "alphas": list(args.hack_eval_alphas),
         "dose_response_beta_inception": beta_inception,
-        "dose_response_success": beta_inception < 0,
+        "dose_response_slope_tolerance": slope_tolerance,
+        "dose_response_best_fid": dose_best_fid,
+        "dose_response_best_alpha": args.hack_eval_alphas[
+            dose_best_index
+        ],
+        "dose_response_success": dose_response_success,
         "random_phase": args.hack_random_phase,
     }
     if get_global_rank() == 0:
