@@ -26,7 +26,7 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 : "${OPT_IMAGES:=50000}"
 : "${VAL_IMAGES:=5000}"
 : "${TEST_IMAGES:=50000}"
-: "${PGD_STEPS:=100}"
+: "${PGD_STEPS:=500}"
 : "${CACHE_ROOT:=./work_dirs/hacking_cache}"
 
 TOTAL_GPUS=$(( NNODES * GPUS_PER_NODE ))

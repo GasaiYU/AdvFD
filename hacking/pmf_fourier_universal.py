@@ -2,16 +2,16 @@
 
 The experiment has three strictly separated cached splits:
 
-* optimization: estimate a low-dimensional Fourier descent direction;
+* optimization: estimate a Fourier or full-resolution bandpass direction;
 * validation: select/early-stop using Inception FD only;
 * test: report the final Inception and CLIP dose response.
 
 The generator is used only when a cache shard is missing.  During pattern
 optimization the generator is unloaded, Inception is frozen, and CLIP is not
-loaded.  The only trainable object is a small set of real Fourier
-coefficients shared by every image.  Optimization gradients come from one
-joint FD over the complete optimization split, evaluated with a two-pass
-sufficient-statistics backward rather than noisy per-batch FDs.
+loaded. The only trainable object is one pattern shared by every image.
+Optimization gradients come from one joint FD over the complete optimization
+split, evaluated with a two-pass sufficient-statistics backward rather than
+noisy per-batch FDs.
 """
 
 from __future__ import annotations
@@ -610,6 +610,73 @@ class FourierPattern(nn.Module):
         self.coeff.div_(rms)
 
 
+class SpatialBandpassPattern(nn.Module):
+    """Full-resolution spatial noise projected to a fixed frequency band."""
+
+    def __init__(
+        self,
+        size: int,
+        min_radius: float,
+        max_radius: float,
+        eps: float = 1e-12,
+    ):
+        super().__init__()
+        if size < 3:
+            raise ValueError("Spatial pattern size must be at least 3")
+        self.size = int(size)
+        self.eps = float(eps)
+        self.coeff = nn.Parameter(
+            torch.zeros(3, size, size, dtype=torch.float32)
+        )
+        frequency_y = torch.fft.fftfreq(size)
+        frequency_x = torch.fft.rfftfreq(size)
+        radius = torch.sqrt(
+            frequency_y[:, None].square()
+            + frequency_x[None, :].square()
+        )
+        mask = (
+            (radius >= float(min_radius))
+            & (radius <= float(max_radius))
+        )
+        if not bool(mask.any()):
+            raise ValueError(
+                "Spatial frequency band contains no discrete frequencies"
+            )
+        self.register_buffer(
+            "frequency_mask",
+            mask.to(torch.float32),
+            persistent=True,
+        )
+
+    def _bandpass(self, value: torch.Tensor) -> torch.Tensor:
+        frequency = torch.fft.rfft2(value, norm="ortho")
+        return torch.fft.irfft2(
+            frequency * self.frequency_mask,
+            s=(self.size, self.size),
+            norm="ortho",
+        )
+
+    def patch(self, *, normalize: bool) -> torch.Tensor:
+        patch = self._bandpass(self.coeff).unsqueeze(0)
+        patch = patch - patch.mean(dim=(-2, -1), keepdim=True)
+        if normalize:
+            rms = patch.square().mean().add(self.eps).sqrt()
+            patch = patch / rms
+        return patch
+
+    @torch.no_grad()
+    def normalize_coefficients_(self) -> None:
+        projected = self._bandpass(self.coeff)
+        projected = projected - projected.mean(
+            dim=(-2, -1), keepdim=True
+        )
+        rms = projected.square().mean().add(self.eps).sqrt()
+        self.coeff.copy_(projected / rms)
+
+
+UniversalHackingPattern = FourierPattern | SpatialBandpassPattern
+
+
 def _tile_patch(
     patch: torch.Tensor,
     height: int,
@@ -624,7 +691,7 @@ def _tile_patch(
 
 def _apply_fourier_pattern(
     images: torch.Tensor,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
     *,
     alpha: float,
     phase: tuple[int, int] = (0, 0),
@@ -654,7 +721,7 @@ def _phase_for(
 def _full_cached_fd_gradient(
     args: argparse.Namespace,
     inception: nn.Module,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
     optimization_images: torch.Tensor,
     mu_ref: torch.Tensor,
     sigma_ref: torch.Tensor,
@@ -853,7 +920,7 @@ def _full_cached_fd_gradient(
 def _cached_inception_fd(
     args: argparse.Namespace,
     inception: nn.Module,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
     split: CachedImageSplit,
     ref_mu: np.ndarray,
     ref_sigma: np.ndarray,
@@ -902,7 +969,7 @@ def _cached_inception_fd(
 
 def _save_pattern_checkpoint(
     args: argparse.Namespace,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
     *,
     name: str,
     stage: str,
@@ -913,11 +980,15 @@ def _save_pattern_checkpoint(
     if get_global_rank() != 0:
         return None
     path = Path(args.ckpt_dir) / name
-    payload = {
+    pattern_type = (
+        "fourier"
+        if isinstance(pattern, FourierPattern)
+        else "spatial_bandpass"
+    )
+    payload: dict[str, object] = {
         "pattern": pattern.state_dict(),
+        "pattern_type": pattern_type,
         "pattern_size": pattern.size,
-        "frequencies": [list(pair) for pair in pattern.frequencies],
-        "fourier_modes": len(pattern.frequencies),
         "fourier_min_radius": args.hack_fourier_min_radius,
         "fourier_max_radius": args.hack_fourier_max_radius,
         "stage": stage,
@@ -926,27 +997,53 @@ def _save_pattern_checkpoint(
         "validation_baseline_fid": validation_baseline_fid,
         "train_alpha": args.hack_train_alpha,
         "generator_checkpoint": args.load_from,
+        "spatial_pattern": (
+            pattern.patch(normalize=True)[0].detach().cpu()
+        ),
     }
+    if isinstance(pattern, FourierPattern):
+        payload.update(
+            {
+                "frequencies": [
+                    list(pair) for pair in pattern.frequencies
+                ],
+                "fourier_modes": len(pattern.frequencies),
+            }
+        )
     torch.save(payload, path)
-    logger.info("Saved Fourier pattern checkpoint: %s", path)
+    logger.info("Saved %s pattern checkpoint: %s", pattern_type, path)
     return path
 
 
 def _load_pattern_checkpoint(
     path: str | Path,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
 ) -> dict[str, object]:
     checkpoint = torch.load(
         path, map_location="cuda", weights_only=False
     )
-    expected = [list(pair) for pair in pattern.frequencies]
-    if checkpoint.get("frequencies") != expected:
+    expected_type = (
+        "fourier"
+        if isinstance(pattern, FourierPattern)
+        else "spatial_bandpass"
+    )
+    checkpoint_type = checkpoint.get("pattern_type", "fourier")
+    if checkpoint_type != expected_type:
         raise ValueError(
-            "Checkpoint Fourier frequencies do not match current arguments"
+            f"Checkpoint pattern_type={checkpoint_type!r} does not match "
+            f"current pattern_type={expected_type!r}"
         )
+    if isinstance(pattern, FourierPattern):
+        expected = [list(pair) for pair in pattern.frequencies]
+        if checkpoint.get("frequencies") != expected:
+            raise ValueError(
+                "Checkpoint Fourier frequencies do not match current "
+                "arguments"
+            )
     pattern.load_state_dict(checkpoint["pattern"])
     logger.info(
-        "Loaded Fourier pattern %s (stage=%s step=%s validation_fid=%s)",
+        "Loaded %s pattern %s (stage=%s step=%s validation_fid=%s)",
+        checkpoint_type,
         path,
         checkpoint.get("stage"),
         checkpoint.get("step"),
@@ -958,7 +1055,7 @@ def _load_pattern_checkpoint(
 @torch.no_grad()
 def _save_pattern_preview(
     args: argparse.Namespace,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
 ) -> None:
     if get_global_rank() != 0:
         return
@@ -981,7 +1078,7 @@ def _save_pattern_preview(
 def _optimize_pattern(
     args: argparse.Namespace,
     inception: nn.Module,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
     cache_root: Path,
     wandb_logger=None,
 ) -> dict[str, object]:
@@ -1207,7 +1304,7 @@ def _optimize_pattern(
 
 
 def _clone_pattern_state(
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
 ) -> dict[str, torch.Tensor]:
     return {
         key: value.detach().clone()
@@ -1218,7 +1315,7 @@ def _clone_pattern_state(
 def _overfit_pattern(
     args: argparse.Namespace,
     inception: nn.Module,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
     cache_root: Path,
     wandb_logger=None,
 ) -> dict[str, object]:
@@ -1246,9 +1343,12 @@ def _overfit_pattern(
         ref_sigma,
         alpha=args.hack_train_alpha,
     )
-    best_fid = baseline_fid
-    best_state = _clone_pattern_state(pattern)
-    best_stage = "zero"
+    require_nonzero = args.hack_require_nonzero_selection
+    best_fid = math.inf if require_nonzero else baseline_fid
+    best_state: dict[str, torch.Tensor] | None = (
+        None if require_nonzero else _clone_pattern_state(pattern)
+    )
+    best_stage = "none" if require_nonzero else "zero"
     best_step = 0
     history.append(
         {
@@ -1257,18 +1357,19 @@ def _overfit_pattern(
             "fid": baseline_fid,
             "delta_from_baseline": 0.0,
             "step_size": 0.0,
-            "accepted": True,
+            "accepted": not require_nonzero,
         }
     )
-    _save_pattern_checkpoint(
-        args,
-        pattern,
-        name="fourier_pattern_overfit_best.pth",
-        stage=best_stage,
-        step=best_step,
-        validation_fid=best_fid,
-        validation_baseline_fid=baseline_fid,
-    )
+    if not require_nonzero:
+        _save_pattern_checkpoint(
+            args,
+            pattern,
+            name="fourier_pattern_overfit_best.pth",
+            stage=best_stage,
+            step=best_step,
+            validation_fid=best_fid,
+            validation_baseline_fid=baseline_fid,
+        )
 
     initial_checkpoint: dict[str, object] | None = None
     zero_joint_fid: float | None = None
@@ -1547,7 +1648,21 @@ def _overfit_pattern(
                 step=step,
             )
 
+    if best_state is None:
+        raise RuntimeError(
+            "No nonzero pattern candidate was produced for selection"
+        )
     pattern.load_state_dict(best_state)
+    selected_raw_rms = float(
+        pattern.patch(normalize=False).square().mean().sqrt().item()
+    )
+    selected_nonzero = (
+        math.isfinite(selected_raw_rms) and selected_raw_rms > 1e-6
+    )
+    if require_nonzero and not selected_nonzero:
+        raise RuntimeError(
+            "Nonzero checkpoint selection produced a zero pattern"
+        )
     _save_pattern_checkpoint(
         args,
         pattern,
@@ -1593,7 +1708,10 @@ def _overfit_pattern(
     slope_tolerance = improvement_tolerance / max(alpha_span, 1e-12)
     dose_best_index = int(np.argmin(dose_values))
     dose_best_fid = dose_values[dose_best_index]
-    fit_success = best_fid < baseline_fid - improvement_tolerance
+    fit_success = (
+        selected_nonzero
+        and best_fid < baseline_fid - improvement_tolerance
+    )
     dose_response_success = (
         fit_success
         and dose_best_fid < baseline_fid - improvement_tolerance
@@ -1611,6 +1729,11 @@ def _overfit_pattern(
         "success_fid_tolerance": improvement_tolerance,
         "selected_stage": best_stage,
         "selected_step": best_step,
+        "require_nonzero_selection": require_nonzero,
+        "selected_pattern_nonzero": selected_nonzero,
+        "selected_pattern_raw_rms": selected_raw_rms,
+        "selected_applied_model_rms": args.hack_train_alpha,
+        "selected_applied_pixel_rms": args.hack_train_alpha / 2.0,
         "completed_pgd_steps": completed_steps,
         "zero_gradient_rms": zero_gradient_rms,
         "negative_gradient_fid": descent_fid,
@@ -1732,7 +1855,7 @@ def _evaluate_test(
     args: argparse.Namespace,
     inception: nn.Module,
     inception_dim: int,
-    pattern: FourierPattern,
+    pattern: UniversalHackingPattern,
     cache_root: Path,
     optimization_summary: dict[str, object],
 ) -> dict[str, object]:
@@ -2094,6 +2217,15 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hack_validation_seed", type=int, default=23_456)
     parser.add_argument("--hack_test_seed", type=int, default=34_567)
     parser.add_argument("--hack_pattern_size", type=int, default=16)
+    parser.add_argument(
+        "--hack_pattern_parameterization",
+        choices=["fourier", "spatial_bandpass"],
+        default="fourier",
+        help=(
+            "spatial_bandpass learns one full-resolution universal noise "
+            "while projecting it to the configured Fourier radius band"
+        ),
+    )
     parser.add_argument("--hack_fourier_modes", type=int, default=48)
     parser.add_argument(
         "--hack_fourier_min_radius", type=float, default=0.15
@@ -2197,6 +2329,15 @@ def get_args_parser() -> argparse.ArgumentParser:
             "selected Fourier-pattern checkpoint"
         ),
     )
+    parser.add_argument(
+        "--hack_require_nonzero_selection",
+        action="store_true",
+        help=(
+            "exclude the clean zero pattern from checkpoint selection; "
+            "success still requires the selected nonzero pattern to beat "
+            "the clean 50k baseline"
+        ),
+    )
     return parser
 
 
@@ -2224,19 +2365,35 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     inception, inception_dim = _load_frozen_repr(
         "inception", target_size=299
     )
-    pattern = FourierPattern(
-        args.hack_pattern_size,
-        args.hack_fourier_modes,
-        args.hack_fourier_min_radius,
-        args.hack_fourier_max_radius,
-    ).cuda()
-    logger.info(
-        "Fourier pattern: size=%d modes=%d trainable=%d frequencies=%s",
-        pattern.size,
-        len(pattern.frequencies),
-        pattern.coeff.numel(),
-        pattern.frequencies,
-    )
+    if args.hack_pattern_parameterization == "fourier":
+        pattern: UniversalHackingPattern = FourierPattern(
+            args.hack_pattern_size,
+            args.hack_fourier_modes,
+            args.hack_fourier_min_radius,
+            args.hack_fourier_max_radius,
+        ).cuda()
+        logger.info(
+            "Fourier pattern: size=%d modes=%d trainable=%d "
+            "frequencies=%s",
+            pattern.size,
+            len(pattern.frequencies),
+            pattern.coeff.numel(),
+            pattern.frequencies,
+        )
+    else:
+        pattern = SpatialBandpassPattern(
+            args.hack_pattern_size,
+            args.hack_fourier_min_radius,
+            args.hack_fourier_max_radius,
+        ).cuda()
+        logger.info(
+            "Spatial bandpass pattern: size=%d trainable=%d "
+            "radius=[%.4f, %.4f]",
+            pattern.size,
+            pattern.coeff.numel(),
+            args.hack_fourier_min_radius,
+            args.hack_fourier_max_radius,
+        )
 
     optimization_summary: dict[str, object]
     if args.hack_overfit_only:

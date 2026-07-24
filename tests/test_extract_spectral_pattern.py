@@ -25,6 +25,7 @@ from hacking.extract_spectral_pattern import (
     synthesize_pattern,
     write_outputs,
 )
+from hacking.pmf_fourier_universal import SpatialBandpassPattern
 
 
 def _write_synthetic_cache(
@@ -86,6 +87,43 @@ def _write_synthetic_cache(
 
 
 class SpectralPatternTest(unittest.TestCase):
+    def test_spatial_bandpass_pattern_is_nonzero_unit_rms(self) -> None:
+        pattern = SpatialBandpassPattern(
+            size=16,
+            min_radius=0.1,
+            max_radius=0.5,
+        )
+        generator = torch.Generator().manual_seed(87)
+        with torch.no_grad():
+            pattern.coeff.copy_(
+                torch.randn(
+                    pattern.coeff.shape,
+                    generator=generator,
+                )
+            )
+            pattern.normalize_coefficients_()
+        applied = pattern.patch(normalize=True)
+        self.assertEqual(tuple(applied.shape), (1, 3, 16, 16))
+        torch.testing.assert_close(
+            applied.mean(dim=(-2, -1)),
+            torch.zeros(1, 3),
+            atol=1e-6,
+            rtol=0,
+        )
+        self.assertAlmostEqual(
+            float(applied.detach().square().mean().sqrt()),
+            1.0,
+            places=5,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_path = Path(temporary) / "spatial.pth"
+            torch.save(
+                {"spatial_pattern": applied[0]},
+                checkpoint_path,
+            )
+            loaded = load_spatial_pattern(checkpoint_path)
+            torch.testing.assert_close(loaded, applied[0])
+
     def test_parallel_pattern_application_resumes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

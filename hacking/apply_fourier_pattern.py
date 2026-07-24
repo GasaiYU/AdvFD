@@ -45,7 +45,7 @@ def _prepare_spatial_pattern(
             "Pattern must have shape [3,H,W] or [1,3,H,W], "
             f"got {tuple(pattern.shape)}"
         )
-    pattern = pattern.float()
+    pattern = pattern.detach().float()
     pattern = pattern - pattern.mean(dim=(-2, -1), keepdim=True)
     rms = pattern.square().mean().sqrt()
     if not torch.isfinite(rms) or float(rms) <= 1e-12:
@@ -57,6 +57,16 @@ def _prepare_spatial_pattern(
 
 def _pattern_from_checkpoint(path: Path) -> torch.Tensor:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if (
+        isinstance(checkpoint, dict)
+        and "spatial_pattern" in checkpoint
+    ):
+        pattern = checkpoint["spatial_pattern"]
+        if not isinstance(pattern, torch.Tensor):
+            raise ValueError(
+                f"{path} has a non-tensor spatial_pattern export"
+            )
+        return pattern.float()
     state = checkpoint.get("pattern", checkpoint)
     required = {"coeff", "cos_basis", "sin_basis"}
     if not isinstance(state, dict) or not required.issubset(state):
