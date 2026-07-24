@@ -252,3 +252,27 @@ pattern, alpha, phase, and image count.
 Use `--random_sample 10 --sample_seed 2026` to apply the pattern to a
 reproducible random subset of ten images. The selected relative paths are
 recorded in the output manifest.
+
+## Transfer the JiT-B-Inception spectrum to pMF
+
+Run the complete 50k experiment with one command:
+
+```bash
+bash hacking/run_jit_spectrum_to_pmf.sh
+```
+
+The script generates 50k images from the configured JiT-B-Inception
+checkpoint, estimates a fixed RGB high-frequency spectrum without training,
+and preserves the pixel-space amplitude implied by that spectrum. It then
+generates 50k pMF-B images, adds the unnormalized pattern with pixel-space
+weight 1, and evaluates both the original and patched folders with Inception
+FID. It also saves a deterministic 50-image patched subset under
+`hacking/images/`.
+
+The checkpoint paths, generation presets, image count, alpha, and output
+paths are internal defaults. An environment variable only needs to be set
+when intentionally overriding one of them, for example:
+
+```bash
+ALPHA=2.0 bash hacking/run_jit_spectrum_to_pmf.sh
+```

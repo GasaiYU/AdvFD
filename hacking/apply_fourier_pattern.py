@@ -30,7 +30,11 @@ IMAGE_SUFFIXES = {
 }
 
 
-def _normalize_spatial_pattern(pattern: torch.Tensor) -> torch.Tensor:
+def _prepare_spatial_pattern(
+    pattern: torch.Tensor,
+    *,
+    normalize_rms: bool,
+) -> torch.Tensor:
     if pattern.ndim == 4 and pattern.shape[0] == 1:
         pattern = pattern[0]
     if pattern.ndim != 3 or pattern.shape[0] != 3:
@@ -41,7 +45,9 @@ def _normalize_spatial_pattern(pattern: torch.Tensor) -> torch.Tensor:
     pattern = pattern.float()
     pattern = pattern - pattern.mean(dim=(-2, -1), keepdim=True)
     rms = pattern.square().mean().sqrt()
-    if float(rms) > 1e-12:
+    if not torch.isfinite(rms) or float(rms) <= 1e-12:
+        raise ValueError("Pattern has zero or non-finite RMS")
+    if normalize_rms:
         pattern = pattern / rms
     return pattern.contiguous()
 
@@ -76,7 +82,11 @@ def _pattern_from_checkpoint(path: Path) -> torch.Tensor:
     return cosine + sine
 
 
-def load_spatial_pattern(path: str | Path) -> torch.Tensor:
+def load_spatial_pattern(
+    path: str | Path,
+    *,
+    normalize_rms: bool = True,
+) -> torch.Tensor:
     path = Path(path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"Pattern not found: {path}")
@@ -88,7 +98,10 @@ def load_spatial_pattern(path: str | Path) -> torch.Tensor:
         raise ValueError(
             f"Unsupported pattern file {path}; use .npy, .pt, or .pth"
         )
-    return _normalize_spatial_pattern(pattern)
+    return _prepare_spatial_pattern(
+        pattern,
+        normalize_rms=normalize_rms,
+    )
 
 
 def tile_pattern(
@@ -236,6 +249,14 @@ def get_args_parser() -> argparse.ArgumentParser:
         default="model",
         help="model matches the pMF [-1,1] experiment",
     )
+    parser.add_argument(
+        "--preserve_pattern_scale",
+        action="store_true",
+        help=(
+            "do not normalize the loaded pattern to unit RMS; use its "
+            "stored amplitude exactly"
+        ),
+    )
     parser.add_argument("--shift_y", type=int, default=0)
     parser.add_argument("--shift_x", type=int, default=0)
     parser.add_argument(
@@ -301,7 +322,10 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("--limit and --random_sample are mutually exclusive")
 
     pattern_path = Path(args.pattern).expanduser().resolve()
-    pattern = load_spatial_pattern(pattern_path)
+    pattern = load_spatial_pattern(
+        pattern_path,
+        normalize_rms=not args.preserve_pattern_scale,
+    )
     sources = _discover_images(input_dir, args.recursive)
     discovered_images = len(sources)
     if args.random_sample:
@@ -346,7 +370,8 @@ def main(args: argparse.Namespace) -> None:
         f"mean={float(pattern.mean()):.6g} "
         f"rms={float(pattern.square().mean().sqrt()):.6g}"
     )
-    effective_pixel_rms = (
+    pattern_rms = float(pattern.square().mean().sqrt())
+    effective_pixel_rms = pattern_rms * (
         args.alpha / 2.0
         if args.alpha_space == "model"
         else args.alpha
@@ -386,6 +411,7 @@ def main(args: argparse.Namespace) -> None:
         "pattern_shape": list(pattern.shape),
         "pattern_mean": float(pattern.mean()),
         "pattern_rms": float(pattern.square().mean().sqrt()),
+        "pattern_scale_preserved": args.preserve_pattern_scale,
         "alpha": args.alpha,
         "alpha_space": args.alpha_space,
         "effective_pixel_rms": effective_pixel_rms,

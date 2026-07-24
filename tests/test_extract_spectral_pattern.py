@@ -7,11 +7,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 from hacking.apply_fourier_pattern import load_spatial_pattern
 from hacking.extract_spectral_pattern import (
     decode_cache_images,
     discover_cache,
+    discover_image_directory,
     extract_spectral_pattern,
     gaussian_highpass,
     synthesize_pattern,
@@ -78,6 +80,53 @@ def _write_synthetic_cache(
 
 
 class SpectralPatternTest(unittest.TestCase):
+    def test_flat_image_directory_matches_uint8_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_root = root / "cache"
+            expected_images = _write_synthetic_cache(cache_root)
+            image_root = root / "images"
+            image_root.mkdir()
+            for index, tensor in enumerate(expected_images):
+                array = tensor.permute(1, 2, 0).numpy()
+                Image.fromarray(array).save(
+                    image_root / f"{index:06d}.png"
+                )
+
+            cache_inventory = discover_cache(
+                cache_root, "optimization"
+            )
+            image_inventory = discover_image_directory(image_root)
+            self.assertEqual(
+                image_inventory.total_images, expected_images.shape[0]
+            )
+            kwargs = {
+                "num_images": expected_images.shape[0],
+                "batch_size": 5,
+                "device": torch.device("cpu"),
+                "blur_sigma": 1.0,
+                "seed": 2026,
+                "log_every": 100,
+            }
+            from_cache = extract_spectral_pattern(
+                cache_inventory, **kwargs
+            )
+            from_images = extract_spectral_pattern(
+                image_inventory, **kwargs
+            )
+            np.testing.assert_allclose(
+                from_cache.pattern,
+                from_images.pattern,
+                rtol=3e-4,
+                atol=3e-4,
+            )
+            np.testing.assert_allclose(
+                from_cache.cross_spectrum,
+                from_images.cross_spectrum,
+                rtol=1e-5,
+                atol=1e-8,
+            )
+
     def test_cache_discovery_and_deterministic_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "cache"
@@ -218,8 +267,44 @@ class SpectralPatternTest(unittest.TestCase):
             spatial_width=16,
             seed=2,
         )
+        preserved, _ = synthesize_pattern(
+            identity_spectrum,
+            spatial_width=16,
+            seed=1,
+            normalize_rms=False,
+        )
         torch.testing.assert_close(first, repeated, rtol=0, atol=0)
         self.assertFalse(torch.equal(first, different))
+        preserved_rms = preserved.square().mean().sqrt()
+        torch.testing.assert_close(
+            first,
+            preserved / preserved_rms,
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+    def test_pattern_loader_can_preserve_stored_scale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pattern_path = Path(temporary) / "pattern.npy"
+            generator = np.random.default_rng(9)
+            stored = generator.normal(
+                0.0, 0.025, size=(3, 16, 16)
+            ).astype(np.float32)
+            stored -= stored.mean(axis=(1, 2), keepdims=True)
+            np.save(pattern_path, stored)
+
+            preserved = load_spatial_pattern(
+                pattern_path, normalize_rms=False
+            )
+            normalized = load_spatial_pattern(pattern_path)
+            np.testing.assert_allclose(
+                preserved.numpy(), stored, rtol=1e-6, atol=1e-7
+            )
+            self.assertAlmostEqual(
+                float(normalized.square().mean().sqrt()),
+                1.0,
+                places=6,
+            )
 
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
-"""Extract a deterministic natural-spectrum RGB pattern from a pMF cache.
+"""Extract a deterministic natural-spectrum RGB pattern from images.
 
 This utility performs no metric optimization and has no trainable parameters.
-It streams a fixed generated-image cache once, estimates the RGB
-cross-spectral density of high-pass residuals, and uses a seeded closed-form
-Gaussian synthesis to produce one zero-mean, unit-RMS spatial pattern.
+It streams a fixed generated-image cache or flat image directory once,
+estimates the RGB cross-spectral density of high-pass residuals, and uses a
+seeded closed-form Gaussian synthesis to produce one zero-mean, unit-RMS
+spatial pattern.
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ from PIL import Image
 
 
 logger = logging.getLogger("spectral_pattern")
-ALGORITHM_VERSION = 1
+ALGORITHM_VERSION = 2
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_NAMES = (
     "spectral_stats.npz",
     "spectral_pattern.npy",
@@ -59,6 +61,17 @@ class CacheInventory:
 
 
 @dataclass(frozen=True)
+class ImageDirectoryInventory:
+    image_dir: Path
+    image_paths: tuple[Path, ...]
+    total_images: int
+    fingerprint: str
+
+
+SourceInventory = CacheInventory | ImageDirectoryInventory
+
+
+@dataclass(frozen=True)
 class ExtractionResult:
     pattern: np.ndarray
     cross_spectrum: np.ndarray
@@ -76,6 +89,7 @@ class ExtractionResult:
     pattern_channel_mean: np.ndarray
     pattern_rms: float
     radial_psd_cosine: float
+    unit_rms_normalized: bool
 
 
 def _sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -238,6 +252,37 @@ def discover_cache(cache_root: str | Path, split: str) -> CacheInventory:
     )
 
 
+def discover_image_directory(
+    image_dir: str | Path,
+) -> ImageDirectoryInventory:
+    """Discover a flat, deterministically ordered generated-image folder."""
+    root = Path(image_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"Image directory not found: {root}")
+    paths = tuple(
+        sorted(
+            path
+            for path in root.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        )
+    )
+    if not paths:
+        raise FileNotFoundError(f"No supported images found in {root}")
+    digest = hashlib.sha256()
+    for path in paths:
+        stat = path.stat()
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"\0")
+    return ImageDirectoryInventory(
+        image_dir=root,
+        image_paths=paths,
+        total_images=len(paths),
+        fingerprint=digest.hexdigest(),
+    )
+
+
 def iter_cached_batches(
     inventory: CacheInventory,
     *,
@@ -291,6 +336,56 @@ def iter_cached_batches(
         raise RuntimeError(
             f"Cache traversal ended with {remaining} images missing"
         )
+
+
+def iter_source_batches(
+    inventory: SourceInventory,
+    *,
+    num_images: int,
+    batch_size: int,
+    device: torch.device,
+) -> Iterator[torch.Tensor]:
+    """Yield decoded float32 RGB batches in [0,1] from either source."""
+    if isinstance(inventory, CacheInventory):
+        for cached_images in iter_cached_batches(
+            inventory,
+            num_images=num_images,
+            batch_size=batch_size,
+        ):
+            yield decode_cache_images(
+                cached_images,
+                dtype_name=inventory.dtype_name,
+                device=device,
+            )
+        return
+
+    if num_images < 1 or num_images > inventory.total_images:
+        raise ValueError(
+            f"num_images={num_images} must be in "
+            f"[1,{inventory.total_images}]"
+        )
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    selected = inventory.image_paths[:num_images]
+    for start in range(0, num_images, batch_size):
+        tensors: list[torch.Tensor] = []
+        for path in selected[start : start + batch_size]:
+            with Image.open(path) as opened:
+                array = np.asarray(
+                    opened.convert("RGB"), dtype=np.uint8
+                ).copy()
+            tensors.append(
+                torch.from_numpy(array).permute(2, 0, 1)
+            )
+        shapes = {tuple(tensor.shape) for tensor in tensors}
+        if len(shapes) != 1:
+            raise ValueError(
+                "Image directory batch contains mixed resolutions: "
+                f"{sorted(shapes)}"
+            )
+        yield torch.stack(tensors).to(
+            device=device, dtype=torch.float32
+        ).div_(255.0)
 
 
 def decode_cache_images(
@@ -427,6 +522,7 @@ def synthesize_pattern(
     *,
     spatial_width: int,
     seed: int,
+    normalize_rms: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Closed-form seeded synthesis from an RGB cross-spectrum."""
     if (
@@ -483,7 +579,8 @@ def synthesize_pattern(
         raise FloatingPointError(
             "Synthesized pattern has zero or non-finite RMS"
         )
-    pattern = pattern / rms
+    if normalize_rms:
+        pattern = pattern / rms
     return pattern, colored
 
 
@@ -534,7 +631,7 @@ def radial_energy_profile(
 
 
 def extract_spectral_pattern(
-    inventory: CacheInventory,
+    inventory: SourceInventory,
     *,
     num_images: int,
     batch_size: int,
@@ -542,8 +639,9 @@ def extract_spectral_pattern(
     blur_sigma: float,
     seed: int,
     log_every: int = 5_000,
+    normalize_rms: bool = True,
 ) -> ExtractionResult:
-    """Stream cache images, estimate CSD, and synthesize one pattern."""
+    """Stream source images, estimate CSD, and synthesize one pattern."""
     if num_images < 2:
         raise ValueError("At least two images are required")
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -559,16 +657,12 @@ def extract_spectral_pattern(
     next_log = min(log_every, num_images)
     started = time.perf_counter()
 
-    for cached_images in iter_cached_batches(
+    for images in iter_source_batches(
         inventory,
         num_images=num_images,
         batch_size=batch_size,
+        device=device,
     ):
-        images = decode_cache_images(
-            cached_images,
-            dtype_name=inventory.dtype_name,
-            device=device,
-        )
         batch_height, batch_width = images.shape[-2:]
         if cross_sum is None:
             height, width = batch_height, batch_width
@@ -629,7 +723,6 @@ def extract_spectral_pattern(
             )
             next_log += log_every
         del (
-            cached_images,
             images,
             residual,
             frequency,
@@ -672,6 +765,7 @@ def extract_spectral_pattern(
         cross_spectrum,
         spatial_width=width,
         seed=seed,
+        normalize_rms=normalize_rms,
     )
     source_psd_tensor = torch.diagonal(
         cross_spectrum, dim1=-2, dim2=-1
@@ -738,6 +832,7 @@ def extract_spectral_pattern(
         pattern_channel_mean=channel_mean,
         pattern_rms=pattern_rms,
         radial_psd_cosine=radial_cosine,
+        unit_rms_normalized=bool(normalize_rms),
     )
 
 
@@ -756,7 +851,7 @@ def _preview_array(pattern: np.ndarray) -> np.ndarray:
 
 def write_outputs(
     result: ExtractionResult,
-    inventory: CacheInventory,
+    inventory: SourceInventory,
     output_dir: str | Path,
     *,
     overwrite: bool,
@@ -787,6 +882,9 @@ def write_outputs(
         ),
         seed=np.asarray(result.seed, dtype=np.int64),
         blur_sigma=np.asarray(result.blur_sigma, dtype=np.float64),
+        unit_rms_normalized=np.asarray(
+            result.unit_rms_normalized, dtype=np.bool_
+        ),
     )
     _atomic_npy(result.pattern.astype(np.float32), paths["spectral_pattern.npy"])
     preview = _preview_array(result.pattern)
@@ -818,16 +916,10 @@ def write_outputs(
     finally:
         radial_temporary.unlink(missing_ok=True)
 
-    manifest_path = inventory.cache_root / "manifest.json"
-    output_hashes = {
-        name: _sha256(path)
-        for name, path in paths.items()
-        if name != "manifest.json"
-    }
-    manifest: dict[str, object] = {
-        "algorithm": "rgb_highpass_cross_spectral_synthesis",
-        "algorithm_version": ALGORITHM_VERSION,
-        "source": {
+    if isinstance(inventory, CacheInventory):
+        manifest_path = inventory.cache_root / "manifest.json"
+        source_manifest: dict[str, object] = {
+            "kind": "pmf_cache",
             "cache_root": str(inventory.cache_root),
             "split": inventory.split,
             "cache_fingerprint": inventory.fingerprint,
@@ -844,14 +936,39 @@ def write_outputs(
                 }
                 for path in inventory.index_paths
             ],
-        },
+        }
+    else:
+        source_manifest = {
+            "kind": "image_directory",
+            "image_dir": str(inventory.image_dir),
+            "image_fingerprint": inventory.fingerprint,
+            "directory_total_images": inventory.total_images,
+            "used_images": result.num_images,
+            "first_image": inventory.image_paths[0].name,
+            "last_used_image": inventory.image_paths[
+                result.num_images - 1
+            ].name,
+        }
+    output_hashes = {
+        name: _sha256(path)
+        for name, path in paths.items()
+        if name != "manifest.json"
+    }
+    manifest: dict[str, object] = {
+        "algorithm": "rgb_highpass_cross_spectral_synthesis",
+        "algorithm_version": ALGORITHM_VERSION,
+        "source": source_manifest,
         "parameters": {
             "blur_sigma": result.blur_sigma,
             "seed": result.seed,
             "resolution": [result.height, result.width],
             "fft_normalization": "ortho",
             "window": "hann_rms_normalized",
-            "pattern_normalization": "per_channel_zero_mean_global_unit_rms",
+            "pattern_normalization": (
+                "per_channel_zero_mean_global_unit_rms"
+                if result.unit_rms_normalized
+                else "per_channel_zero_mean_preserve_spectral_scale"
+            ),
         },
         "diagnostics": {
             "pattern_channel_mean": result.pattern_channel_mean.tolist(),
@@ -878,12 +995,20 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Extract a deterministic natural-spectrum RGB pattern from "
-            "cached pMF images without metric optimization"
+            "images without metric optimization"
         )
     )
     parser.add_argument(
         "--cache_root",
         default="./work_dirs/hacking_cache/pMF_B_256",
+    )
+    parser.add_argument(
+        "--image_dir",
+        default=None,
+        help=(
+            "flat generated-image folder; when set, takes precedence over "
+            "--cache_root/--split"
+        ),
     )
     parser.add_argument("--split", default="optimization")
     parser.add_argument("--num_images", type=int, default=50_000)
@@ -892,6 +1017,14 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blur_sigma", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--log_every", type=int, default=5_000)
+    parser.add_argument(
+        "--preserve_spectral_scale",
+        action="store_true",
+        help=(
+            "keep the pixel-space RMS implied by the estimated spectrum; "
+            "otherwise normalize the synthesized pattern to unit RMS"
+        ),
+    )
     parser.add_argument(
         "--output_dir",
         default="./work_dirs/spectral_pattern/pMF_B_256",
@@ -915,15 +1048,25 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("--blur_sigma must be finite and positive")
     device = torch.device(args.device)
 
-    inventory = discover_cache(args.cache_root, args.split)
-    logger.info(
-        "cache=%s split=%s total_images=%d dtype=%s ranks=%d",
-        inventory.cache_root,
-        inventory.split,
-        inventory.total_images,
-        inventory.dtype_name,
-        len(inventory.index_paths),
-    )
+    if args.image_dir is not None:
+        inventory: SourceInventory = discover_image_directory(
+            args.image_dir
+        )
+        logger.info(
+            "image_dir=%s total_images=%d",
+            inventory.image_dir,
+            inventory.total_images,
+        )
+    else:
+        inventory = discover_cache(args.cache_root, args.split)
+        logger.info(
+            "cache=%s split=%s total_images=%d dtype=%s ranks=%d",
+            inventory.cache_root,
+            inventory.split,
+            inventory.total_images,
+            inventory.dtype_name,
+            len(inventory.index_paths),
+        )
     started = time.perf_counter()
     result = extract_spectral_pattern(
         inventory,
@@ -933,6 +1076,7 @@ def main(args: argparse.Namespace) -> None:
         blur_sigma=args.blur_sigma,
         seed=args.seed,
         log_every=args.log_every,
+        normalize_rms=not args.preserve_spectral_scale,
     )
     elapsed = time.perf_counter() - started
     paths = write_outputs(
