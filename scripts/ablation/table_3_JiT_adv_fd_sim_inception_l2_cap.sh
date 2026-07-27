@@ -12,7 +12,7 @@ cd "$REPO_ROOT"
 : "${MODEL_SIZE:=B}"
 : "${LOAD_INIT:=base}"
 : "${FD_ADV_WEIGHT:=0.1}"
-: "${FD_ADV_FEATURE_NORM_CAP:=35}"
+: "${FD_ADV_FEATURE_NORM_CAP:=40}"
 
 # Export values also consumed by the parent when this wrapper supplied their
 # defaults rather than inheriting them from the caller's environment.
