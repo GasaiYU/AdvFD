@@ -1,11 +1,41 @@
 """Adversarial real-whitened FD helpers."""
 
 import logging
+import math
 
 import torch
 
 
 logger = logging.getLogger("FD_loss")
+
+
+def hard_l2_feature_cap(
+    features: torch.Tensor,
+    max_norm: float,
+) -> torch.Tensor:
+    """Project each feature vector onto a closed L2 ball.
+
+    ``max_norm <= 0`` disables the transform. Norms and projections are
+    evaluated in FP32 for low-precision features so the hard bound is not
+    weakened by FP16/BF16 scale rounding. The transform remains
+    differentiable with respect to ``features``.
+    """
+    if not math.isfinite(max_norm):
+        raise ValueError("FD-Adv feature norm cap must be finite")
+    if max_norm <= 0.0:
+        return features
+    if features.ndim == 0:
+        raise ValueError("FD-Adv features must have a feature dimension")
+
+    norm_features = (
+        features.float()
+        if features.dtype in (torch.float16, torch.bfloat16)
+        else features
+    )
+    norms = torch.linalg.vector_norm(norm_features, ord=2, dim=-1, keepdim=True)
+    bound = norms.new_tensor(float(max_norm))
+    scale = bound / norms.clamp_min(bound)
+    return norm_features * scale
 
 
 class FeatureStatsEMA(torch.nn.Module):
@@ -137,6 +167,12 @@ def save_fd_adv_states(judges):
         state = {
             "name": judge["name"],
             "init_mode": judge.get("adv_init_mode", "pretrained"),
+            "feature_norm_cap": float(judge.get("adv_feature_norm_cap", 0.0)),
+            "feature_transform": (
+                "hard_l2_v1"
+                if float(judge.get("adv_feature_norm_cap", 0.0)) > 0.0
+                else "none"
+            ),
             "optimizer": optimizer.state_dict(),
         }
         state["model"] = model.state_dict()
@@ -177,6 +213,30 @@ def load_fd_adv_states(judges, saved_states):
                 f"init_mode={saved_init_mode!r}; current run expects "
                 f"init_mode={expected_init_mode!r}. Use a separate experiment "
                 "directory or remove the incompatible resume checkpoint."
+            )
+        expected_feature_norm_cap = float(judge.get("adv_feature_norm_cap", 0.0))
+        saved_feature_norm_cap = float(state.get("feature_norm_cap", 0.0))
+        if not math.isclose(
+            saved_feature_norm_cap,
+            expected_feature_norm_cap,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                f"[FD-Adv] Cannot restore '{judge['name']}' with "
+                f"feature_norm_cap={saved_feature_norm_cap}; current run expects "
+                f"{expected_feature_norm_cap}. Use a separate experiment "
+                "directory or remove the incompatible resume checkpoint."
+            )
+        expected_feature_transform = (
+            "hard_l2_v1" if expected_feature_norm_cap > 0.0 else "none"
+        )
+        saved_feature_transform = state.get("feature_transform", "none")
+        if saved_feature_transform != expected_feature_transform:
+            raise RuntimeError(
+                f"[FD-Adv] Cannot restore '{judge['name']}' with "
+                f"feature_transform={saved_feature_transform!r}; current run expects "
+                f"{expected_feature_transform!r}."
             )
         if "model" in state:
             try:

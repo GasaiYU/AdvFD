@@ -40,6 +40,7 @@ from frechet_distance.judges import (
 from frechet_distance.adversarial import (
     FeatureStatsEMA,
     build_real_whitening,
+    hard_l2_feature_cap,
     load_fd_adv_states,
     real_whitened_frechet_distance_from_stats,
     save_fd_adv_states,
@@ -337,7 +338,7 @@ def resolve_fd_adv_per_model_args(args):
     args.fd_adv_repr_decoupled = True
 
 
-def _extract_adv_features(judge, images):
+def _extract_adv_features(judge, images, return_pre_cap_norms=False):
     if judge.get("adv_backbone") == "patchgan":
         features = judge["adv_model"].forward_features(images.clamp(0.0, 1.0))
         features = features.permute(0, 2, 3, 1).reshape(-1, features.shape[1])
@@ -345,14 +346,29 @@ def _extract_adv_features(judge, images):
         if max_patches > 0 and features.shape[0] > max_patches:
             idx = torch.randperm(features.shape[0], device=features.device)[:max_patches]
             features = features.index_select(0, idx)
-        return features
+        return (features, None) if return_pre_cap_norms else features
     primary, secondary = judge["adv_model"](images)
-    return secondary if judge.get("pool_type") == "avg" else primary
+    features = secondary if judge.get("pool_type") == "avg" else primary
+    feature_norm_cap = float(judge.get("adv_feature_norm_cap", 0.0))
+    pre_cap_norms = None
+    if return_pre_cap_norms and feature_norm_cap > 0.0:
+        pre_cap_norms = torch.linalg.vector_norm(
+            features.float(),
+            ord=2,
+            dim=-1,
+        )
+    capped_features = hard_l2_feature_cap(
+        features,
+        feature_norm_cap,
+    )
+    if return_pre_cap_norms:
+        return capped_features, pre_cap_norms
+    return capped_features
 
 
 @torch.no_grad()
-def _adv_feature_scale_stats(features):
-    """Summarize the magnitude of a batch of raw FD-Adv features."""
+def _adv_feature_scale_stats(features, feature_norm_cap=0.0):
+    """Summarize the magnitude of a batch of effective FD-Adv features."""
     if features.ndim == 0:
         raise ValueError("FD-Adv features must have a batch dimension")
 
@@ -365,25 +381,54 @@ def _adv_feature_scale_stats(features):
         raise ValueError("FD-Adv features must be non-empty")
 
     squared = features.square()
+    l2_norms = squared.sum(dim=1).clamp_min(0.0).sqrt()
     mean = features.mean(dim=0)
     second_moment = squared.mean(dim=0)
-    stats = torch.stack([
+    stat_names = [
+        "rms",
+        "mean_rms",
+        "centered_rms",
+        "l2_mean",
+        "l2_max",
+        "uncentered_second_moment_trace",
+    ]
+    stat_values = [
         second_moment.mean().clamp_min(0.0).sqrt(),
         mean.square().mean().clamp_min(0.0).sqrt(),
         features.var(dim=0, unbiased=False).mean().clamp_min(0.0).sqrt(),
-        squared.sum(dim=1).clamp_min(0.0).sqrt().mean(),
+        l2_norms.mean(),
+        l2_norms.max(),
         second_moment.sum(),
-    ]).cpu().tolist()
-    return dict(zip(
-        (
-            "rms",
-            "mean_rms",
-            "centered_rms",
-            "l2_mean",
-            "uncentered_second_moment_trace",
-        ),
-        stats,
-    ))
+    ]
+    if feature_norm_cap > 0.0:
+        stat_names.extend(("norm_cap", "norm_cap_fraction"))
+        stat_values.extend((
+            l2_norms.new_tensor(float(feature_norm_cap)),
+            (l2_norms >= float(feature_norm_cap) * (1.0 - 1e-6)).float().mean(),
+        ))
+    return dict(zip(stat_names, torch.stack(stat_values).cpu().tolist()))
+
+
+@torch.no_grad()
+def _adv_pre_cap_norm_stats(norms, feature_norm_cap):
+    norms = norms.detach().float().reshape(-1)
+    if norms.numel() == 0:
+        raise ValueError("FD-Adv pre-cap norms must be non-empty")
+    cap = float(feature_norm_cap)
+    scales = norms.new_tensor(cap) / norms.clamp_min(cap)
+    quantiles = torch.quantile(
+        norms,
+        norms.new_tensor([0.95, 0.99]),
+    )
+    return {
+        "l2_mean": float(norms.mean()),
+        "l2_p95": float(quantiles[0]),
+        "l2_p99": float(quantiles[1]),
+        "l2_max": float(norms.max()),
+        "norm_cap_fraction": float((norms > cap).float().mean()),
+        "radial_scale_mean": float(scales.mean()),
+        "radial_scale_min": float(scales.min()),
+    }
 
 
 @torch.no_grad()
@@ -1319,21 +1364,35 @@ def get_fd_train_step(
             if real_images_for_adv is None:
                 real_images_for_adv, _ = real_batch_fn()
 
-            def _adv_real_stats_for_loss(judge):
+            def _adv_real_stats_for_loss(judge, return_pre_cap_norms=False):
                 if not update_adv_real_stats:
                     real_mu, real_cov = judge["adv_real_stats"].current_stats()
-                    return real_mu, real_cov, None
+                    return real_mu, real_cov, None, None
+                pre_cap_norms = None
                 if args.fd_adv_detach_real:
                     with torch.no_grad():
-                        real_adv = diff_all_gather(
-                            _extract_adv_features(judge, real_images_for_adv.detach())
-                        ).detach()
+                        extracted = _extract_adv_features(
+                            judge,
+                            real_images_for_adv.detach(),
+                            return_pre_cap_norms=return_pre_cap_norms,
+                        )
                 else:
-                    real_adv = diff_all_gather(
-                        _extract_adv_features(judge, real_images_for_adv.detach())
+                    extracted = _extract_adv_features(
+                        judge,
+                        real_images_for_adv.detach(),
+                        return_pre_cap_norms=return_pre_cap_norms,
                     )
+                if return_pre_cap_norms:
+                    real_adv_local, pre_cap_norms_local = extracted
+                    real_adv = diff_all_gather(real_adv_local)
+                    if pre_cap_norms_local is not None:
+                        pre_cap_norms = diff_all_gather(pre_cap_norms_local.detach())
+                else:
+                    real_adv = diff_all_gather(extracted)
+                if args.fd_adv_detach_real:
+                    real_adv = real_adv.detach()
                 real_mu, real_cov = judge["adv_real_stats"].build_stats(real_adv)
-                return real_mu, real_cov, real_adv.detach()
+                return real_mu, real_cov, real_adv.detach(), pre_cap_norms
 
             for judge in adv_judges:
                 if not update_adv_model:
@@ -1415,7 +1474,7 @@ def get_fd_train_step(
                         neg_adv = diff_all_gather(
                             _extract_adv_features(judge, neg_images)
                         )
-                        real_mu, real_cov, real_update = _adv_real_stats_for_loss(judge)
+                        real_mu, real_cov, real_update, _ = _adv_real_stats_for_loss(judge)
                         fake_stats = judge.get("adv_neg_stats") or judge["adv_fake_stats"]
                         fake_mu, fake_cov = fake_stats.build_stats(neg_adv)
                         if args.fd_adv_no_whiten:
@@ -1512,24 +1571,57 @@ def get_fd_train_step(
                     continue
                 _set_requires_grad(adv_model, False)
                 adv_model.eval()
-                fake_adv = diff_all_gather(
-                    _extract_adv_features(judge, sampled)
-                )
-                real_mu, real_cov, real_update = _adv_real_stats_for_loss(judge)
                 log_feature_scale = (
                     args.fd_adv_log_feature_scale
                     and args.current_step % args.fd_adv_log_feature_scale_freq == 0
                 )
+                feature_norm_cap = float(judge.get("adv_feature_norm_cap", 0.0))
+                log_pre_cap_norms = log_feature_scale and feature_norm_cap > 0.0
+                extracted = _extract_adv_features(
+                    judge,
+                    sampled,
+                    return_pre_cap_norms=log_pre_cap_norms,
+                )
+                fake_pre_cap_norms = None
+                if log_pre_cap_norms:
+                    fake_adv_local, fake_pre_cap_norms_local = extracted
+                    fake_adv = diff_all_gather(fake_adv_local)
+                    fake_pre_cap_norms = diff_all_gather(fake_pre_cap_norms_local.detach())
+                else:
+                    fake_adv = diff_all_gather(extracted)
+                real_mu, real_cov, real_update, real_pre_cap_norms = _adv_real_stats_for_loss(
+                    judge,
+                    return_pre_cap_norms=log_pre_cap_norms,
+                )
                 if log_feature_scale:
                     feature_scale_by_split = {
-                        "fake": _adv_feature_scale_stats(fake_adv),
+                        "fake": _adv_feature_scale_stats(
+                            fake_adv,
+                            feature_norm_cap=feature_norm_cap,
+                        ),
                     }
                     if real_update is not None:
-                        feature_scale_by_split["real"] = _adv_feature_scale_stats(real_update)
+                        feature_scale_by_split["real"] = _adv_feature_scale_stats(
+                            real_update,
+                            feature_norm_cap=feature_norm_cap,
+                        )
+                    pre_cap_norms_by_split = {}
+                    if fake_pre_cap_norms is not None:
+                        pre_cap_norms_by_split["fake"] = fake_pre_cap_norms
+                    if real_pre_cap_norms is not None:
+                        pre_cap_norms_by_split["real"] = real_pre_cap_norms
                     for split, scale_stats in feature_scale_by_split.items():
                         for stat_name, stat_value in scale_stats.items():
                             loss_dict[
                                 f"fd_adv_feature_scale_{split}_{stat_name}_{judge['name']}"
+                            ] = stat_value
+                    for split, pre_cap_norms in pre_cap_norms_by_split.items():
+                        for stat_name, stat_value in _adv_pre_cap_norm_stats(
+                            pre_cap_norms,
+                            feature_norm_cap,
+                        ).items():
+                            loss_dict[
+                                f"fd_adv_feature_pre_cap_{split}_{stat_name}_{judge['name']}"
                             ] = stat_value
                     if real_update is not None:
                         real_rms = feature_scale_by_split["real"]["rms"]
@@ -1698,6 +1790,13 @@ def train_and_evaluate(args):
         raise ValueError("fd_grad_normpreserve_eps must be finite and > 0")
     if args.fd_adv_grad_clip < 0.0:
         raise ValueError("fd_adv_grad_clip must be >= 0")
+    if (
+        not math.isfinite(args.fd_adv_feature_norm_cap)
+        or args.fd_adv_feature_norm_cap < 0.0
+    ):
+        raise ValueError("fd_adv_feature_norm_cap must be finite and >= 0")
+    if args.fd_adv_feature_norm_cap > 0.0 and args.fd_adv_backbone != "repr":
+        raise ValueError("--fd_adv_feature_norm_cap is only supported with --fd_adv_backbone repr")
     if args.fd_adv_lora_rank < 0:
         raise ValueError("fd_adv_lora_rank must be >= 0")
     if args.fd_adv_lora_rank > 0 and args.fd_adv_lora_alpha <= 0.0:
@@ -1995,6 +2094,11 @@ def train_and_evaluate(args):
                     inception_pretrained=not random_adv_init,
                 )
                 adv_backbone_label = "repr"
+            adv_feature_norm_cap = (
+                float(args.fd_adv_feature_norm_cap)
+                if adv_backbone_label == "repr"
+                else 0.0
+            )
             adv_lora_modules = 0
             if args.fd_adv_lora_rank > 0:
                 if adv_backbone_label != "repr":
@@ -2047,6 +2151,7 @@ def train_and_evaluate(args):
                 "adv_dim": adv_feat_dim,
                 "adv_backbone": adv_backbone_label,
                 "adv_init_mode": "random" if random_adv_init else "pretrained",
+                "adv_feature_norm_cap": adv_feature_norm_cap,
                 "adv_max_patches": args.fd_adv_patch_max_patches,
                 "adv_lora_modules": adv_lora_modules,
                 "adv_trainable_params": adv_trainable_param_count,
@@ -2079,6 +2184,7 @@ def train_and_evaluate(args):
                 f"dim={adv_judge['adv_dim']}, "
                 f"init_mode={adv_judge['adv_init_mode']}, "
                 f"random_init_stats_images={args.fd_adv_random_init_stats_images}, "
+                f"feature_norm_cap={adv_judge['adv_feature_norm_cap']}, "
                 f"repr_weight={weight}, global_weight={args.fd_adv_weight}, lr={args.fd_adv_lr}, "
                 f"steps={args.fd_adv_steps}, grad_clip={args.fd_adv_grad_clip}, "
                 f"update_freq={args.fd_adv_update_freq}, "
@@ -2671,6 +2777,8 @@ def get_args_parser():
                         help="initialize only FD-Adv Inception reprs from scratch with fan-in He weights")
     parser.add_argument("--fd_adv_random_init_stats_images", type=int, default=4096,
                         help="real/fake images used to bootstrap scratch FD-Adv repr moments")
+    parser.add_argument("--fd_adv_feature_norm_cap", type=float, default=0.0,
+                        help="hard per-sample L2 cap for FD-Adv repr features; 0 disables it")
     parser.add_argument("--fd_adv_lora_rank", type=int, default=0,
                         help="train only LoRA adapters in repr FD-Adv psi; 0 disables LoRA")
     parser.add_argument("--fd_adv_lora_alpha", type=float, default=64.0,
