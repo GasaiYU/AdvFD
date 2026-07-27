@@ -90,14 +90,14 @@ run_one() {
         "$@"
 }
 
-# run_one "${MODEL}-fd-inception-high-lr" \
-#     --fd_repr_models inception \
-    # --patch_gan_weight 1e-4 \
-    # --patch_gan_lr 1e-6
-run_one "${MODEL}-fd-sim-high-lr-100x" \
-    --fd_repr_models "$SIGLIP" "$MAE" inception \
-    --fd_repr_pool_types cls cls cls \
-    --fd_target_sizes 224 224 256
+run_one "${MODEL}-fd-inception" \
+    --fd_repr_models inception
+
+# SIM（SigLIP + MAE + Inception）配置，如需切回可启用下面这段：
+# run_one "${MODEL}-fd-sim-high-lr-100x" \
+#     --fd_repr_models "$SIGLIP" "$MAE" inception \
+#     --fd_repr_pool_types cls cls cls \
+#     --fd_target_sizes 224 224 256
 # run_one "${MODEL}-fd-mae-cls" \
 #     --fd_repr_models "$MAE" \
 #     --fd_repr_pool_types cls \
