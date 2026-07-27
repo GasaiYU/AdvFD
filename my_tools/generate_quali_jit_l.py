@@ -23,7 +23,11 @@ intermediates after the composites have been validated.
 
 Example (8 GPUs)::
 
-    torchrun --standalone --nproc_per_node=8 paper/generate_quali_jit_l.py
+    torchrun --standalone --nproc_per_node=8 my_tools/generate_quali_jit_l.py
+
+The same resumable pipeline supports pMF-L via ``--generator_family pmf_l``.
+The companion ``my_tools/generate_quali_pmf_l.py`` entry point supplies the
+pMF-L checkpoint and sampling defaults.
 
 The existing paper evaluations use the top-level ``model`` weights for all
 three checkpoints, which is also the default here.  To reproduce the original
@@ -67,7 +71,7 @@ from utils.distributed_util import (
 from utils.sampling_util import generate_images
 
 
-LOGGER = logging.getLogger("jit_l_quali")
+LOGGER = logging.getLogger("threeway_quali")
 
 DTYPES = {
     "bf16": torch.bfloat16,
@@ -86,6 +90,8 @@ class ModelSpec:
     checkpoint: Path
     weight_key: str
     sampling_steps: int
+    family: str
+    model_name: str
 
 
 def default_imagenet_train_dir() -> Path | None:
@@ -99,7 +105,13 @@ def default_imagenet_train_dir() -> Path | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate aligned JiT-L / FD Loss / Adv FD paper samples."
+        description="Generate aligned original / FD Loss / Adv FD paper samples."
+    )
+    parser.add_argument(
+        "--generator_family",
+        choices=("jit_l", "pmf_l"),
+        default="jit_l",
+        help="Use the JiT-L workflow or the pMF-L workflow.",
     )
     parser.add_argument(
         "--output_root",
@@ -179,17 +191,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise_seed", type=int, default=20260717)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--img_size", type=int, default=256)
-    parser.add_argument("--cfg", type=float, default=2.4)
-    parser.add_argument("--interval_min", type=float, default=0.1)
-    parser.add_argument("--interval_max", type=float, default=1.0)
+    parser.add_argument("--cfg", type=float, default=None)
+    parser.add_argument("--interval_min", type=float, default=None)
+    parser.add_argument("--interval_max", type=float, default=None)
     parser.add_argument(
-        "--sampling_method", choices=("euler", "heun"), default="heun"
+        "--sampling_method", choices=("euler", "heun"), default=None
     )
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="bf16")
-    parser.add_argument("--noise_scale", type=float, default=1.0)
-    parser.add_argument("--original_steps", type=int, default=50)
-    parser.add_argument("--fd_steps", type=int, default=1)
-    parser.add_argument("--adv_steps", type=int, default=1)
+    parser.add_argument("--noise_scale", type=float, default=None)
+    parser.add_argument("--original_steps", type=int, default=None)
+    parser.add_argument("--fd_steps", type=int, default=None)
+    parser.add_argument("--adv_steps", type=int, default=None)
     parser.add_argument(
         "--imagenet_train_dir",
         type=Path,
@@ -221,6 +233,42 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_specs(args: argparse.Namespace) -> list[ModelSpec]:
+    if args.generator_family == "pmf_l":
+        return [
+            ModelSpec(
+                key="original",
+                display_name="pMF-L (original)",
+                output_name="pmf_l_original",
+                checkpoint=args.original_checkpoint.expanduser().resolve(),
+                weight_key=args.original_weight_key,
+                sampling_steps=(
+                    args.original_steps if args.original_steps is not None else 1
+                ),
+                family="pmf_l",
+                model_name="pMF_L",
+            ),
+            ModelSpec(
+                key="fd_loss",
+                display_name="pMF-L + FD Loss",
+                output_name="pmf_l_fd_loss",
+                checkpoint=args.fd_checkpoint.expanduser().resolve(),
+                weight_key=args.fd_weight_key,
+                sampling_steps=args.fd_steps if args.fd_steps is not None else 1,
+                family="pmf_l",
+                model_name="pMF_L",
+            ),
+            ModelSpec(
+                key="adv_fd",
+                display_name="pMF-L + Adv FD",
+                output_name="pmf_l_adv_fd",
+                checkpoint=args.adv_checkpoint.expanduser().resolve(),
+                weight_key=args.adv_weight_key,
+                sampling_steps=args.adv_steps if args.adv_steps is not None else 1,
+                family="pmf_l",
+                model_name="pMF_L",
+            ),
+        ]
+
     return [
         ModelSpec(
             key="original",
@@ -228,7 +276,11 @@ def build_specs(args: argparse.Namespace) -> list[ModelSpec]:
             output_name="jit_l_original",
             checkpoint=args.original_checkpoint.expanduser().resolve(),
             weight_key=args.original_weight_key,
-            sampling_steps=args.original_steps,
+            sampling_steps=(
+                args.original_steps if args.original_steps is not None else 50
+            ),
+            family="jit_l",
+            model_name="JiT_L",
         ),
         ModelSpec(
             key="fd_loss",
@@ -236,7 +288,9 @@ def build_specs(args: argparse.Namespace) -> list[ModelSpec]:
             output_name="jit_l_fd_loss",
             checkpoint=args.fd_checkpoint.expanduser().resolve(),
             weight_key=args.fd_weight_key,
-            sampling_steps=args.fd_steps,
+            sampling_steps=args.fd_steps if args.fd_steps is not None else 1,
+            family="jit_l",
+            model_name="JiT_L",
         ),
         ModelSpec(
             key="adv_fd",
@@ -244,7 +298,9 @@ def build_specs(args: argparse.Namespace) -> list[ModelSpec]:
             output_name="jit_l_adv_fd",
             checkpoint=args.adv_checkpoint.expanduser().resolve(),
             weight_key=args.adv_weight_key,
-            sampling_steps=args.adv_steps,
+            sampling_steps=args.adv_steps if args.adv_steps is not None else 1,
+            family="jit_l",
+            model_name="JiT_L",
         ),
     ]
 
@@ -388,6 +444,8 @@ def checkpoint_record(spec: ModelSpec) -> dict[str, Any]:
         "checkpoint_bytes": stat.st_size,
         "checkpoint_mtime_ns": stat.st_mtime_ns,
         "weight_key": spec.weight_key,
+        "family": spec.family,
+        "model_name": spec.model_name,
         "sampling_steps": spec.sampling_steps,
     }
 
@@ -411,17 +469,22 @@ def build_generation_identity(
         "class_ids_sha256": class_id_digest,
         "noise_policy": "torch_cpu_randn_v1: Generator seed = noise_seed + class_id",
         "noise_seed": args.noise_seed,
-        "model": "JiT_L",
+        "generator_family": args.generator_family,
+        "model": specs[0].model_name,
         "img_size": args.img_size,
         "num_classes": args.num_classes,
         "cfg": args.cfg,
         "cfg_interval": [args.interval_min, args.interval_max],
-        "sampling_method": args.sampling_method,
+        "sampling_method": (
+            "native_pmf_euler"
+            if args.generator_family == "pmf_l"
+            else args.sampling_method
+        ),
         "dtype": args.dtype,
         "noise_scale": args.noise_scale,
         "rope_2d": True,
         "learned_pe": True,
-        "legacy_time_convention": True,
+        "legacy_time_convention": args.generator_family == "jit_l",
         "models": [checkpoint_record(spec) for spec in specs],
         "paper_output": {
             "type": "horizontal_concat",
@@ -561,19 +624,24 @@ def write_run_metadata(
             ).hexdigest(),
         },
         "weights_note": (
-            "Defaults match this repo's online evaluations. For the upstream "
-            "JiT convention use --original_weight_key model_ema1."
+            (
+                "Top-level model weights match evaluate_released_ckpt.sh "
+                "with --eval_ema_labels online."
+            )
+            if args.generator_family == "pmf_l"
+            else (
+                "Defaults match this repo's online evaluations. For the "
+                "upstream JiT convention use --original_weight_key model_ema1."
+            )
         ),
     }
 
     if args.threeway_only:
-        all_output_names = {"jit_l_threeway": COMPOSITE_OUTPUT_NAME}
+        all_output_names = {COMPOSITE_OUTPUT_NAME: COMPOSITE_OUTPUT_NAME}
     else:
         all_output_names = {
-            "jit_l_original": "jit_l_original",
-            "jit_l_fd_loss": "jit_l_fd_loss",
-            "jit_l_adv_fd": "jit_l_adv_fd",
-            "jit_l_threeway": COMPOSITE_OUTPUT_NAME,
+            **{spec.output_name: spec.output_name for spec in all_specs},
+            COMPOSITE_OUTPUT_NAME: COMPOSITE_OUTPUT_NAME,
         }
     manifest_path = output_root / "manifest.csv"
     tmp_manifest = output_root / ".manifest.csv.tmp"
@@ -638,21 +706,52 @@ def write_run_metadata(
 
 
 def build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
-    model = models.JiTDenoiser_models["JiT_L"](
-        img_size=args.img_size,
-        num_classes=args.num_classes,
-        label_drop_prob=0.1,
-        attn_dropout=0.0,
-        proj_dropout=0.0,
-        P_mean=0.8,
-        P_std=0.8,
-        t_eps=5e-2,
-        noise_scale=args.noise_scale,
-        rope_2d=True,
-        learned_pe=True,
-        legacy_time_convention=True,
-        grad_checkpointing=False,
-    )
+    if args.generator_family == "pmf_l":
+        model = models.pMFDenoiser_models["pMF_L"](
+            img_size=args.img_size,
+            patch_size=16,
+            in_channels=3,
+            tokenizer_patch_size=1,
+            num_classes=args.num_classes,
+            label_drop_prob=0.1,
+            P_mean=0.8,
+            P_std=0.8,
+            ratio_r_neq_t=0.5,
+            cfg_beta=1.0,
+            tr_uniform=False,
+            cfg_omega_max=7.0,
+            aux_head_depth=8,
+            class_tokens=8,
+            time_tokens=4,
+            guidance_tokens=4,
+            interval_tokens=2,
+            t_eps=5e-2,
+            perceptual_threshold=0.8,
+            perceptual_loss_on_aux=False,
+            rope_2d=True,
+            learned_pe=True,
+            disable_v_head=True,
+            noise_scale=args.noise_scale,
+            norm_eps=0.01,
+            norm_p=1.0,
+            grad_checkpointing=False,
+        )
+    else:
+        model = models.JiTDenoiser_models["JiT_L"](
+            img_size=args.img_size,
+            num_classes=args.num_classes,
+            label_drop_prob=0.1,
+            attn_dropout=0.0,
+            proj_dropout=0.0,
+            P_mean=0.8,
+            P_std=0.8,
+            t_eps=5e-2,
+            noise_scale=args.noise_scale,
+            rope_2d=True,
+            learned_pe=True,
+            legacy_time_convention=True,
+            grad_checkpointing=False,
+        )
     return model.to(device).eval().requires_grad_(False)
 
 
@@ -663,12 +762,19 @@ def load_checkpoint_weights(model: torch.nn.Module, spec: ModelSpec) -> None:
         spec.checkpoint,
         spec.weight_key,
     )
-    checkpoint = torch.load(
-        spec.checkpoint,
-        map_location="cpu",
-        mmap=True,
-        weights_only=True,
-    )
+    if spec.family == "pmf_l":
+        checkpoint = torch.load(
+            spec.checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+    else:
+        checkpoint = torch.load(
+            spec.checkpoint,
+            map_location="cpu",
+            mmap=True,
+            weights_only=True,
+        )
     if not isinstance(checkpoint, dict):
         raise TypeError(f"expected a dict checkpoint, got {type(checkpoint)!r}")
     if spec.weight_key in checkpoint:
@@ -683,7 +789,25 @@ def load_checkpoint_weights(model: torch.nn.Module, spec: ModelSpec) -> None:
             f"weight key {spec.weight_key!r} is absent from {spec.checkpoint}; "
             f"available top-level keys: {available}"
         )
-    model.load_state_dict(state_dict, strict=True)
+    if spec.family == "pmf_l":
+        from models.denoiser_pmf import convert_pmf_checkpoint
+
+        state_dict = convert_pmf_checkpoint(state_dict)
+        message = model.load_state_dict(state_dict, strict=False)
+        if message.missing_keys:
+            LOGGER.warning(
+                "%s checkpoint missing keys: %s",
+                spec.display_name,
+                message.missing_keys,
+            )
+        if message.unexpected_keys:
+            LOGGER.warning(
+                "%s checkpoint unexpected keys: %s",
+                spec.display_name,
+                message.unexpected_keys,
+            )
+    else:
+        model.load_state_dict(state_dict, strict=True)
     torch.cuda.synchronize()
     del state_dict
     del checkpoint
@@ -936,6 +1060,7 @@ def resolved_config_for_print(
 ) -> dict[str, Any]:
     config = {
         "output_root": str(args.output_root),
+        "generator_family": args.generator_family,
         "num_images_per_model": len(samples),
         "unique_classes": len({class_id for _, class_id in samples}),
         "noise_seed": args.noise_seed,
@@ -955,6 +1080,7 @@ def resolved_config_for_print(
         "models": [
             {
                 "name": spec.display_name,
+                "model_name": spec.model_name,
                 "checkpoint": str(spec.checkpoint),
                 "weight_key": spec.weight_key,
                 "sampling_steps": spec.sampling_steps,
@@ -984,7 +1110,23 @@ def resolved_config_for_print(
 
 
 def main() -> None:
+    global COMPOSITE_OUTPUT_NAME
+
     args = parse_args()
+    if args.generator_family == "pmf_l":
+        COMPOSITE_OUTPUT_NAME = "pmf_l_threeway"
+        args.cfg = 7.0 if args.cfg is None else args.cfg
+        args.interval_min = 0.2 if args.interval_min is None else args.interval_min
+        args.interval_max = 0.7 if args.interval_max is None else args.interval_max
+        args.sampling_method = args.sampling_method or "euler"
+        args.noise_scale = 1.0 if args.noise_scale is None else args.noise_scale
+    else:
+        COMPOSITE_OUTPUT_NAME = "jit_l_threeway"
+        args.cfg = 2.4 if args.cfg is None else args.cfg
+        args.interval_min = 0.1 if args.interval_min is None else args.interval_min
+        args.interval_max = 1.0 if args.interval_max is None else args.interval_max
+        args.sampling_method = args.sampling_method or "heun"
+        args.noise_scale = 1.0 if args.noise_scale is None else args.noise_scale
     args.output_root = args.output_root.expanduser().resolve()
     all_specs = build_specs(args)
     requested = set(args.only)
@@ -1067,10 +1209,15 @@ def main() -> None:
                     LOGGER.info("%s already has every requested PNG", spec.display_name)
             else:
                 dirty_samples.update(pending_samples)
-                if model is None:
+                if model is None or args.generator_family == "pmf_l":
+                    if model is not None:
+                        del model
+                        gc.collect()
+                        torch.cuda.empty_cache()
                     model = build_model(args, device)
                     LOGGER.info(
-                        "created JiT-L with %d parameters",
+                        "created %s with %d parameters",
+                        spec.model_name,
                         sum(parameter.numel() for parameter in model.parameters()),
                     )
                 load_checkpoint_weights(model, spec)
@@ -1108,7 +1255,7 @@ def main() -> None:
                 LOGGER.info("all three-way composite PNGs already exist")
             counts[COMPOSITE_OUTPUT_NAME] = finalize_output_directory(
                 args.output_root / COMPOSITE_OUTPUT_NAME,
-                "JiT-L three-way composites",
+                f"{all_specs[0].model_name} three-way composites",
                 COMPOSITE_OUTPUT_NAME,
                 samples,
                 device,

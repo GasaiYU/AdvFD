@@ -13,7 +13,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/mmu-vcg/gaomingju/data/FD-Loss/quali}"
 torchrun \
     --standalone \
     --nproc_per_node="${GPUS_PER_NODE}" \
-    paper/generate_quali_jit_l.py \
+    my_tools/generate_quali_jit_l.py \
     --output_root "${OUTPUT_ROOT}" \
     --class_start 0 \
     --class_count 1000 \
