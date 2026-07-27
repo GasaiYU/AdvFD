@@ -27,7 +27,7 @@ DEFAULT_ID_FILE = Path(
     "/mmu-vcg/gaomingju/data/FD-Loss/quali/id_jit_quali.txt"
 )
 DEFAULT_INPUT_DIR = Path(
-    "/mmu-vcg/gaomingju/data/FD-Loss/quali/jit_l_threeway_quali"
+    "/mmu-vcg/gaomingju/data/FD-Loss/quali/jit_l_threeway"
 )
 IMAGE_SUFFIXES = {
     ".bmp",
@@ -201,7 +201,7 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("paper/jit_l_pair_comparisons"),
+        default=Path("paper/jit_l_pair_comparisons_quali"),
     )
     parser.add_argument("--panel_size", type=int, default=256)
     parser.add_argument("--overwrite", action="store_true")
