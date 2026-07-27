@@ -24,10 +24,10 @@ from PIL import Image, ImageOps
 
 
 DEFAULT_ID_FILE = Path(
-    "/mmu-vcg/gaomingju/data/FD-Loss/quali/id.txt"
+    "/mmu-vcg/gaomingju/data/FD-Loss/quali/id_jit_quali.txt"
 )
 DEFAULT_INPUT_DIR = Path(
-    "/mmu-vcg/gaomingju/data/FD-Loss/quali/jit_l_threeway"
+    "/mmu-vcg/gaomingju/data/FD-Loss/quali/jit_l_threeway_quali"
 )
 IMAGE_SUFFIXES = {
     ".bmp",
