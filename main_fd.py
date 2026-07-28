@@ -44,6 +44,7 @@ from frechet_distance.adversarial import (
     load_fd_adv_states,
     real_whitened_frechet_distance_from_stats,
     save_fd_adv_states,
+    shared_feature_norm_offset_penalty,
     shared_residual_rms_projection,
 )
 from utils.rng_util import RNGStateManager
@@ -1366,9 +1367,16 @@ def get_fd_train_step(
                 real_images_for_adv, _ = real_batch_fn()
             adv_real_reference_cache = {}
 
-            def _extract_adv_real_features(judge, return_pre_cap_norms=False):
+            def _extract_adv_real_features(
+                judge,
+                return_pre_cap_norms=False,
+                require_parameter_grad=False,
+            ):
                 pre_cap_norms = None
-                if args.fd_adv_detach_real:
+                detach_real_forward = (
+                    args.fd_adv_detach_real and not require_parameter_grad
+                )
+                if detach_real_forward:
                     with torch.no_grad():
                         extracted = _extract_adv_features(
                             judge,
@@ -1388,7 +1396,7 @@ def get_fd_train_step(
                         pre_cap_norms = diff_all_gather(pre_cap_norms_local.detach())
                 else:
                     real_adv = diff_all_gather(extracted)
-                if args.fd_adv_detach_real:
+                if detach_real_forward:
                     real_adv = real_adv.detach()
                 return real_adv, pre_cap_norms
 
@@ -1461,6 +1469,60 @@ def get_fd_train_step(
                     projection_metrics,
                 )
 
+            def _adv_norm_offset_for_loss(
+                judge,
+                fake_adv,
+                fake_images=None,
+                fake_reference=None,
+            ):
+                """Build raw FD stats and a symmetric feature-scale penalty."""
+                real_adv, _ = _extract_adv_real_features(
+                    judge,
+                    require_parameter_grad=True,
+                )
+                real_for_fd = (
+                    real_adv.detach() if args.fd_adv_detach_real else real_adv
+                )
+                cache_key = id(judge)
+                real_reference = adv_real_reference_cache.get(cache_key)
+                if real_reference is None:
+                    with torch.no_grad():
+                        real_reference = diff_all_gather(
+                            _extract_adv_reference_features(
+                                judge,
+                                real_images_for_adv.detach(),
+                            )
+                        )
+                    adv_real_reference_cache[cache_key] = real_reference
+                if fake_reference is None:
+                    if fake_images is None:
+                        raise ValueError("fake_images or fake_reference is required")
+                    with torch.no_grad():
+                        fake_reference = diff_all_gather(
+                            _extract_adv_reference_features(judge, fake_images.detach())
+                        )
+                norm_penalty, norm_metrics = shared_feature_norm_offset_penalty(
+                    real_adv,
+                    real_reference,
+                    fake_adv,
+                    fake_reference,
+                )
+                if update_adv_real_stats:
+                    real_mu, real_cov = judge["adv_real_stats"].build_stats(
+                        real_for_fd
+                    )
+                    real_update = real_adv.detach()
+                else:
+                    real_mu, real_cov = judge["adv_real_stats"].current_stats()
+                    real_update = None
+                return (
+                    real_mu,
+                    real_cov,
+                    real_update,
+                    norm_penalty,
+                    norm_metrics,
+                )
+
             for judge in adv_judges:
                 if not update_adv_model:
                     continue
@@ -1485,6 +1547,7 @@ def get_fd_train_step(
                 last_patch_d_fake = None
                 last_adv_grad_norm = None
                 last_adv_residual_metrics = None
+                last_adv_norm_offset_metrics = None
                 neg_real_count = 0
                 neg_fake_count = 0
                 for _ in range(args.fd_adv_steps):
@@ -1542,12 +1605,14 @@ def get_fd_train_step(
                         neg_adv = diff_all_gather(
                             _extract_adv_features(judge, neg_images)
                         )
+                        norm_offset_penalty = None
                         if float(judge.get("adv_residual_rms_kappa", 0.0)) > 0.0:
                             neg_reference = None
                             source_index = judge.get("fd_source_index")
                             if (
                                 args.fd_adv_neg_real_degrade_ratio == 0.0
                                 and source_index is not None
+                                and source_index < len(all_new_feats)
                             ):
                                 neg_reference = all_new_feats[source_index].detach()
                             (
@@ -1557,6 +1622,27 @@ def get_fd_train_step(
                                 neg_adv,
                                 last_adv_residual_metrics,
                             ) = _adv_residual_pair_for_loss(
+                                judge,
+                                neg_adv,
+                                fake_images=neg_images,
+                                fake_reference=neg_reference,
+                            )
+                        elif float(judge.get("adv_norm_offset_weight", 0.0)) > 0.0:
+                            neg_reference = None
+                            source_index = judge.get("fd_source_index")
+                            if (
+                                args.fd_adv_neg_real_degrade_ratio == 0.0
+                                and source_index is not None
+                                and source_index < len(all_new_feats)
+                            ):
+                                neg_reference = all_new_feats[source_index].detach()
+                            (
+                                real_mu,
+                                real_cov,
+                                real_update,
+                                norm_offset_penalty,
+                                last_adv_norm_offset_metrics,
+                            ) = _adv_norm_offset_for_loss(
                                 judge,
                                 neg_adv,
                                 fake_images=neg_images,
@@ -1607,7 +1693,20 @@ def get_fd_train_step(
                             judge["_adv_real_update"] = real_update
                         if judge.get("adv_neg_stats") is not None:
                             judge["_adv_neg_update"] = neg_adv.detach()
-                        (-adv_fd).backward()
+                        critic_loss = -adv_fd
+                        if norm_offset_penalty is not None:
+                            weighted_norm_penalty = (
+                                float(judge["adv_norm_offset_weight"])
+                                * norm_offset_penalty
+                            )
+                            critic_loss = critic_loss + weighted_norm_penalty
+                            last_adv_norm_offset_metrics = dict(
+                                last_adv_norm_offset_metrics
+                            )
+                            last_adv_norm_offset_metrics["weighted_penalty"] = (
+                                weighted_norm_penalty.detach()
+                            )
+                        critic_loss.backward()
                     _check_fd_adv_lora_grads_once(judge)
                     _all_reduce_grads(adv_model)
                     if args.fd_adv_grad_clip > 0.0:
@@ -1635,6 +1734,13 @@ def get_fd_train_step(
                     for metric_name, metric_value in last_adv_residual_metrics.items():
                         loss_dict[
                             f"fd_adv_residual_critic_{metric_name}_{judge['name']}"
+                        ] = float(metric_value)
+                if last_adv_norm_offset_metrics is not None:
+                    for metric_name, metric_value in (
+                        last_adv_norm_offset_metrics.items()
+                    ):
+                        loss_dict[
+                            f"fd_adv_norm_offset_critic_{metric_name}_{judge['name']}"
                         ] = float(metric_value)
                 if args.fd_adv_neg_real_degrade_ratio > 0 and last_adv_fd is not None:
                     denom = max(1, neg_real_count + neg_fake_count)
@@ -1968,6 +2074,27 @@ def train_and_evaluate(args):
         raise ValueError(
             "--fd_adv_residual_rms_kappa requires a pretrained FD-Adv reference"
         )
+    if (
+        not math.isfinite(args.fd_adv_norm_offset_weight)
+        or args.fd_adv_norm_offset_weight < 0.0
+    ):
+        raise ValueError("fd_adv_norm_offset_weight must be finite and >= 0")
+    if args.fd_adv_norm_offset_weight > 0.0 and args.fd_adv_backbone != "repr":
+        raise ValueError(
+            "--fd_adv_norm_offset_weight is only supported with --fd_adv_backbone repr"
+        )
+    if args.fd_adv_norm_offset_weight > 0.0 and args.fd_adv_inception_random_init:
+        raise ValueError(
+            "--fd_adv_norm_offset_weight requires a pretrained FD-Adv reference"
+        )
+    if args.fd_adv_norm_offset_weight > 0.0 and (
+        args.fd_adv_residual_rms_kappa > 0.0
+        or args.fd_adv_feature_norm_cap > 0.0
+    ):
+        raise ValueError(
+            "--fd_adv_norm_offset_weight is mutually exclusive with "
+            "--fd_adv_residual_rms_kappa and --fd_adv_feature_norm_cap"
+        )
     if args.fd_adv_lora_rank < 0:
         raise ValueError("fd_adv_lora_rank must be >= 0")
     if args.fd_adv_lora_rank > 0 and args.fd_adv_lora_alpha <= 0.0:
@@ -2279,6 +2406,11 @@ def train_and_evaluate(args):
                 if adv_backbone_label == "repr"
                 else 0.0
             )
+            adv_norm_offset_weight = (
+                float(args.fd_adv_norm_offset_weight)
+                if adv_backbone_label == "repr"
+                else 0.0
+            )
             fd_source_judge = (
                 None if random_adv_init else fd_judges_by_name.get(short)
             )
@@ -2334,6 +2466,17 @@ def train_and_evaluate(args):
                 # Initial fake EMA moments must come from the same frozen
                 # reference representation used by the residual transform.
                 fd_source_judge = adv_reference_judge
+            if adv_norm_offset_weight > 0.0:
+                if adv_reference_judge is None:
+                    raise ValueError(
+                        f"FD-Adv norm-offset penalty for '{short}' requires "
+                        "the same pretrained repr in --fd_repr_models"
+                    )
+                if int(adv_reference_judge["feat_dim"]) != int(adv_feat_dim):
+                    raise ValueError(
+                        f"FD-Adv norm-offset penalty for '{short}' requires "
+                        "matching main/adv feature dimensions"
+                    )
             adv_lora_modules = 0
             if args.fd_adv_lora_rank > 0:
                 if adv_backbone_label != "repr":
@@ -2389,6 +2532,7 @@ def train_and_evaluate(args):
                 "adv_feature_norm_cap": adv_feature_norm_cap,
                 "adv_residual_rms_kappa": adv_residual_rms_kappa,
                 "adv_residual_rms_tau": adv_residual_rms_tau,
+                "adv_norm_offset_weight": adv_norm_offset_weight,
                 "adv_max_patches": args.fd_adv_patch_max_patches,
                 "adv_lora_modules": adv_lora_modules,
                 "adv_trainable_params": adv_trainable_param_count,
@@ -2424,6 +2568,7 @@ def train_and_evaluate(args):
                 f"feature_norm_cap={adv_judge['adv_feature_norm_cap']}, "
                 f"residual_rms_kappa={adv_judge['adv_residual_rms_kappa']}, "
                 f"residual_rms_tau={adv_judge['adv_residual_rms_tau']}, "
+                f"norm_offset_weight={adv_judge['adv_norm_offset_weight']}, "
                 f"repr_weight={weight}, global_weight={args.fd_adv_weight}, lr={args.fd_adv_lr}, "
                 f"steps={args.fd_adv_steps}, grad_clip={args.fd_adv_grad_clip}, "
                 f"update_freq={args.fd_adv_update_freq}, "
@@ -3022,6 +3167,8 @@ def get_args_parser():
                         help="bound shared real/fake residual RMS to kappa times frozen-reference RMS; 0 disables")
     parser.add_argument("--fd_adv_residual_rms_log_freq", type=int, default=100,
                         help="log shared residual RMS projection metrics every N steps")
+    parser.add_argument("--fd_adv_norm_offset_weight", type=float, default=0.0,
+                        help="critic penalty weight for shared real/fake feature second-moment drift; 0 disables")
     parser.add_argument("--fd_adv_lora_rank", type=int, default=0,
                         help="train only LoRA adapters in repr FD-Adv psi; 0 disables LoRA")
     parser.add_argument("--fd_adv_lora_alpha", type=float, default=64.0,

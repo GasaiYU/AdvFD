@@ -103,6 +103,70 @@ def shared_residual_rms_projection(
     return bounded_real, bounded_fake, metrics
 
 
+def shared_feature_norm_offset_penalty(
+    adv_real: torch.Tensor,
+    ref_real: torch.Tensor,
+    adv_fake: torch.Tensor,
+    ref_fake: torch.Tensor,
+):
+    """Penalize drift in the global real/fake feature second moment.
+
+    The penalty is ``(S_adv / S_ref - 1)**2``, where each second moment is
+    computed on a 50:50 real/fake mixture. Reference inputs are detached so
+    gradients reach only the trainable representation. Inputs are expected to
+    have already been gathered across distributed ranks.
+    """
+    pairs = (
+        ("real", adv_real, ref_real),
+        ("fake", adv_fake, ref_fake),
+    )
+    for split, adv, ref in pairs:
+        if adv.ndim < 2:
+            raise ValueError(f"FD-Adv {split} features must be at least 2D")
+        if adv.shape != ref.shape:
+            raise ValueError(
+                f"FD-Adv {split} adv/reference feature shapes differ: "
+                f"{tuple(adv.shape)} vs {tuple(ref.shape)}"
+            )
+        if adv.shape[0] == 0:
+            raise ValueError(f"FD-Adv {split} feature batch must be non-empty")
+
+    compute_dtype = (
+        torch.float32
+        if adv_real.dtype in (torch.float16, torch.bfloat16)
+        else adv_real.dtype
+    )
+    adv_real_value = adv_real.to(compute_dtype)
+    adv_fake_value = adv_fake.to(compute_dtype)
+    ref_real_value = ref_real.detach().to(compute_dtype)
+    ref_fake_value = ref_fake.detach().to(compute_dtype)
+
+    adv_second_moment = 0.5 * (
+        adv_real_value.square().sum(dim=-1).mean()
+        + adv_fake_value.square().sum(dim=-1).mean()
+    )
+    ref_second_moment = 0.5 * (
+        ref_real_value.square().sum(dim=-1).mean()
+        + ref_fake_value.square().sum(dim=-1).mean()
+    )
+    if not bool(torch.isfinite(ref_second_moment).item()):
+        raise ValueError("FD-Adv reference feature second moment must be finite")
+    if float(ref_second_moment) <= 0.0:
+        raise ValueError("FD-Adv reference feature second moment must be > 0")
+    if not bool(torch.isfinite(adv_second_moment.detach()).item()):
+        raise ValueError("FD-Adv trainable feature second moment must be finite")
+
+    second_moment_ratio = adv_second_moment / ref_second_moment
+    penalty = (second_moment_ratio - 1.0).square()
+    metrics = {
+        "second_moment_ratio": second_moment_ratio.detach(),
+        "penalty": penalty.detach(),
+        "adv_rms": adv_second_moment.clamp_min(0.0).sqrt().detach(),
+        "ref_rms": ref_second_moment.clamp_min(0.0).sqrt().detach(),
+    }
+    return penalty, metrics
+
+
 class FeatureStatsEMA(torch.nn.Module):
     """EMA moments with differentiable current-batch contribution."""
 
@@ -235,6 +299,7 @@ def save_fd_adv_states(judges):
             "feature_norm_cap": float(judge.get("adv_feature_norm_cap", 0.0)),
             "residual_rms_kappa": float(judge.get("adv_residual_rms_kappa", 0.0)),
             "residual_rms_tau": float(judge.get("adv_residual_rms_tau", 0.0)),
+            "norm_offset_weight": float(judge.get("adv_norm_offset_weight", 0.0)),
             "feature_transform": _fd_adv_feature_transform_name(judge),
             "optimizer": optimizer.state_dict(),
         }
@@ -317,6 +382,22 @@ def load_fd_adv_states(judges, saved_states):
                 f"[FD-Adv] Cannot restore '{judge['name']}' with "
                 f"residual_rms_tau={saved_residual_rms_tau}; current run "
                 f"expects {expected_residual_rms_tau}."
+            )
+        expected_norm_offset_weight = float(
+            judge.get("adv_norm_offset_weight", 0.0)
+        )
+        saved_norm_offset_weight = float(state.get("norm_offset_weight", 0.0))
+        if not math.isclose(
+            saved_norm_offset_weight,
+            expected_norm_offset_weight,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                f"[FD-Adv] Cannot restore '{judge['name']}' with "
+                f"norm_offset_weight={saved_norm_offset_weight}; current run "
+                f"expects {expected_norm_offset_weight}. Use a separate "
+                "experiment directory or remove the incompatible resume checkpoint."
             )
         expected_feature_transform = _fd_adv_feature_transform_name(judge)
         saved_feature_transform = state.get("feature_transform", "none")
