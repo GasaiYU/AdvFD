@@ -1576,7 +1576,15 @@ def get_fd_train_step(
                     and args.current_step % args.fd_adv_log_feature_scale_freq == 0
                 )
                 feature_norm_cap = float(judge.get("adv_feature_norm_cap", 0.0))
-                log_pre_cap_norms = log_feature_scale and feature_norm_cap > 0.0
+                log_feature_cap_fraction = (
+                    args.fd_adv_log_feature_cap_fraction
+                    and feature_norm_cap > 0.0
+                    and args.current_step % args.fd_adv_log_feature_cap_fraction_freq == 0
+                )
+                log_pre_cap_norms = (
+                    (log_feature_scale or log_feature_cap_fraction)
+                    and feature_norm_cap > 0.0
+                )
                 extracted = _extract_adv_features(
                     judge,
                     sampled,
@@ -1591,8 +1599,14 @@ def get_fd_train_step(
                     fake_adv = diff_all_gather(extracted)
                 real_mu, real_cov, real_update, real_pre_cap_norms = _adv_real_stats_for_loss(
                     judge,
-                    return_pre_cap_norms=log_pre_cap_norms,
+                    return_pre_cap_norms=log_feature_scale and feature_norm_cap > 0.0,
                 )
+                if log_feature_cap_fraction and fake_pre_cap_norms is not None:
+                    loss_dict[
+                        f"fd_adv_feature_cap_fraction_fake_{judge['name']}"
+                    ] = float(
+                        (fake_pre_cap_norms > feature_norm_cap).float().mean()
+                    )
                 if log_feature_scale:
                     feature_scale_by_split = {
                         "fake": _adv_feature_scale_stats(
@@ -1820,6 +1834,8 @@ def train_and_evaluate(args):
         raise ValueError("fd_adv_real_update_freq must be >= 1")
     if args.fd_adv_log_feature_scale_freq < 1:
         raise ValueError("fd_adv_log_feature_scale_freq must be >= 1")
+    if args.fd_adv_log_feature_cap_fraction_freq < 1:
+        raise ValueError("fd_adv_log_feature_cap_fraction_freq must be >= 1")
     if not 0.0 <= args.fd_adv_neg_real_degrade_ratio <= 1.0:
         raise ValueError("fd_adv_neg_real_degrade_ratio must be in [0, 1]")
     _validate_fd_sequential_backward_args(args)
@@ -2825,6 +2841,10 @@ def get_args_parser():
                         help="log raw real/fake FD-Adv feature magnitude statistics without extra forwards")
     parser.add_argument("--fd_adv_log_feature_scale_freq", type=int, default=20,
                         help="log raw FD-Adv feature magnitude statistics every N steps")
+    parser.add_argument("--fd_adv_log_feature_cap_fraction", action="store_true",
+                        help="log the fraction of fake FD-Adv features whose pre-cap norm exceeds the cap")
+    parser.add_argument("--fd_adv_log_feature_cap_fraction_freq", type=int, default=100,
+                        help="log the fake FD-Adv cap-hit fraction every N steps")
     parser.add_argument("--fd_adv_ema_beta", type=float, default=0.99,
                         help="EMA decay for adversarial psi real/fake feature stats")
     parser.add_argument("--fd_adv_patch_channels", type=int, default=64,

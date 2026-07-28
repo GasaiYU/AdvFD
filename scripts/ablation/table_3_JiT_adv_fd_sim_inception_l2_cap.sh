@@ -27,4 +27,6 @@ EXP_NAME="JiT_${MODEL_SIZE}-fd-sim-advinc-w${FD_ADV_WEIGHT}-from-${LOAD_INIT}-l2
 exec bash scripts/table_3_JiT_adv_fd_sim.sh \
     "$@" \
     --exp_name "$EXP_NAME" \
-    --fd_adv_feature_norm_cap "$FD_ADV_FEATURE_NORM_CAP"
+    --fd_adv_feature_norm_cap "$FD_ADV_FEATURE_NORM_CAP" \
+    --fd_adv_log_feature_cap_fraction \
+    --fd_adv_log_feature_cap_fraction_freq 100
