@@ -44,6 +44,7 @@ from frechet_distance.adversarial import (
     load_fd_adv_states,
     real_whitened_frechet_distance_from_stats,
     save_fd_adv_states,
+    shared_residual_rms_projection,
 )
 from utils.rng_util import RNGStateManager
 from utils.schedule_util import adjust_learning_rate
@@ -1363,11 +1364,9 @@ def get_fd_train_step(
             real_images_for_adv = real_images_for_gan
             if real_images_for_adv is None:
                 real_images_for_adv, _ = real_batch_fn()
+            adv_real_reference_cache = {}
 
-            def _adv_real_stats_for_loss(judge, return_pre_cap_norms=False):
-                if not update_adv_real_stats:
-                    real_mu, real_cov = judge["adv_real_stats"].current_stats()
-                    return real_mu, real_cov, None, None
+            def _extract_adv_real_features(judge, return_pre_cap_norms=False):
                 pre_cap_norms = None
                 if args.fd_adv_detach_real:
                     with torch.no_grad():
@@ -1391,8 +1390,76 @@ def get_fd_train_step(
                     real_adv = diff_all_gather(extracted)
                 if args.fd_adv_detach_real:
                     real_adv = real_adv.detach()
+                return real_adv, pre_cap_norms
+
+            def _adv_real_stats_for_loss(judge, return_pre_cap_norms=False):
+                if not update_adv_real_stats:
+                    real_mu, real_cov = judge["adv_real_stats"].current_stats()
+                    return real_mu, real_cov, None, None
+                real_adv, pre_cap_norms = _extract_adv_real_features(
+                    judge,
+                    return_pre_cap_norms=return_pre_cap_norms,
+                )
                 real_mu, real_cov = judge["adv_real_stats"].build_stats(real_adv)
                 return real_mu, real_cov, real_adv.detach(), pre_cap_norms
+
+            def _extract_adv_reference_features(judge, images):
+                source_judge = judge.get("adv_reference_judge")
+                if source_judge is None:
+                    raise RuntimeError(
+                        f"FD-Adv residual RMS for '{judge['name']}' has no frozen reference"
+                    )
+                return extract_judge_features(source_judge, images)
+
+            def _adv_residual_pair_for_loss(
+                judge,
+                fake_adv,
+                fake_images=None,
+                fake_reference=None,
+            ):
+                """Project one global real/fake pair before EMA/whitening."""
+                real_adv, _ = _extract_adv_real_features(judge)
+                cache_key = id(judge)
+                real_reference = adv_real_reference_cache.get(cache_key)
+                if real_reference is None:
+                    with torch.no_grad():
+                        real_reference = diff_all_gather(
+                            _extract_adv_reference_features(
+                                judge,
+                                real_images_for_adv.detach(),
+                            )
+                        )
+                    adv_real_reference_cache[cache_key] = real_reference
+                if fake_reference is None:
+                    if fake_images is None:
+                        raise ValueError("fake_images or fake_reference is required")
+                    fake_reference = diff_all_gather(
+                        _extract_adv_reference_features(judge, fake_images)
+                    )
+                bounded_real, bounded_fake, projection_metrics = (
+                    shared_residual_rms_projection(
+                        real_adv,
+                        real_reference,
+                        fake_adv,
+                        fake_reference,
+                        tau=judge["adv_residual_rms_tau"],
+                    )
+                )
+                if update_adv_real_stats:
+                    real_mu, real_cov = judge["adv_real_stats"].build_stats(
+                        bounded_real
+                    )
+                    real_update = bounded_real.detach()
+                else:
+                    real_mu, real_cov = judge["adv_real_stats"].current_stats()
+                    real_update = None
+                return (
+                    real_mu,
+                    real_cov,
+                    real_update,
+                    bounded_fake,
+                    projection_metrics,
+                )
 
             for judge in adv_judges:
                 if not update_adv_model:
@@ -1417,6 +1484,7 @@ def get_fd_train_step(
                 last_patch_d_real = None
                 last_patch_d_fake = None
                 last_adv_grad_norm = None
+                last_adv_residual_metrics = None
                 neg_real_count = 0
                 neg_fake_count = 0
                 for _ in range(args.fd_adv_steps):
@@ -1474,7 +1542,30 @@ def get_fd_train_step(
                         neg_adv = diff_all_gather(
                             _extract_adv_features(judge, neg_images)
                         )
-                        real_mu, real_cov, real_update, _ = _adv_real_stats_for_loss(judge)
+                        if float(judge.get("adv_residual_rms_kappa", 0.0)) > 0.0:
+                            neg_reference = None
+                            source_index = judge.get("fd_source_index")
+                            if (
+                                args.fd_adv_neg_real_degrade_ratio == 0.0
+                                and source_index is not None
+                            ):
+                                neg_reference = all_new_feats[source_index].detach()
+                            (
+                                real_mu,
+                                real_cov,
+                                real_update,
+                                neg_adv,
+                                last_adv_residual_metrics,
+                            ) = _adv_residual_pair_for_loss(
+                                judge,
+                                neg_adv,
+                                fake_images=neg_images,
+                                fake_reference=neg_reference,
+                            )
+                        else:
+                            real_mu, real_cov, real_update, _ = (
+                                _adv_real_stats_for_loss(judge)
+                            )
                         fake_stats = judge.get("adv_neg_stats") or judge["adv_fake_stats"]
                         fake_mu, fake_cov = fake_stats.build_stats(neg_adv)
                         if args.fd_adv_no_whiten:
@@ -1537,6 +1628,14 @@ def get_fd_train_step(
                     loss_dict[f"fd_adv_critic_raw_{judge['name']}"] = float(last_adv_raw_fd)
                 if last_adv_grad_norm is not None:
                     loss_dict[f"fd_adv_critic_grad_norm_{judge['name']}"] = float(last_adv_grad_norm)
+                if (
+                    last_adv_residual_metrics is not None
+                    and args.current_step % args.fd_adv_residual_rms_log_freq == 0
+                ):
+                    for metric_name, metric_value in last_adv_residual_metrics.items():
+                        loss_dict[
+                            f"fd_adv_residual_critic_{metric_name}_{judge['name']}"
+                        ] = float(metric_value)
                 if args.fd_adv_neg_real_degrade_ratio > 0 and last_adv_fd is not None:
                     denom = max(1, neg_real_count + neg_fake_count)
                     loss_dict[f"fd_adv_critic_neg_real_ratio_{judge['name']}"] = float(neg_real_count / denom)
@@ -1597,10 +1696,48 @@ def get_fd_train_step(
                     fake_pre_cap_norms = diff_all_gather(fake_pre_cap_norms_local.detach())
                 else:
                     fake_adv = diff_all_gather(extracted)
-                real_mu, real_cov, real_update, real_pre_cap_norms = _adv_real_stats_for_loss(
-                    judge,
-                    return_pre_cap_norms=log_feature_scale and feature_norm_cap > 0.0,
-                )
+                residual_metrics = None
+                if float(judge.get("adv_residual_rms_kappa", 0.0)) > 0.0:
+                    source_index = judge.get("fd_source_index")
+                    fake_reference = None
+                    if not args.fd_grad_normpreserve and source_index is not None:
+                        # Reuse the frozen main-FD feature forward. Its graph
+                        # remains connected to sampled, so the generator sees
+                        # both sides of adv - reference.
+                        fake_reference = all_new_feats[source_index]
+                    (
+                        real_mu,
+                        real_cov,
+                        real_update,
+                        fake_adv,
+                        residual_metrics,
+                    ) = _adv_residual_pair_for_loss(
+                        judge,
+                        fake_adv,
+                        fake_images=sampled,
+                        fake_reference=fake_reference,
+                    )
+                    real_pre_cap_norms = None
+                else:
+                    (
+                        real_mu,
+                        real_cov,
+                        real_update,
+                        real_pre_cap_norms,
+                    ) = _adv_real_stats_for_loss(
+                        judge,
+                        return_pre_cap_norms=(
+                            log_feature_scale and feature_norm_cap > 0.0
+                        ),
+                    )
+                if (
+                    residual_metrics is not None
+                    and args.current_step % args.fd_adv_residual_rms_log_freq == 0
+                ):
+                    for metric_name, metric_value in residual_metrics.items():
+                        loss_dict[
+                            f"fd_adv_residual_{metric_name}_{judge['name']}"
+                        ] = float(metric_value)
                 if log_feature_cap_fraction and fake_pre_cap_norms is not None:
                     loss_dict[
                         f"fd_adv_feature_cap_fraction_fake_{judge['name']}"
@@ -1811,6 +1948,26 @@ def train_and_evaluate(args):
         raise ValueError("fd_adv_feature_norm_cap must be finite and >= 0")
     if args.fd_adv_feature_norm_cap > 0.0 and args.fd_adv_backbone != "repr":
         raise ValueError("--fd_adv_feature_norm_cap is only supported with --fd_adv_backbone repr")
+    if (
+        not math.isfinite(args.fd_adv_residual_rms_kappa)
+        or args.fd_adv_residual_rms_kappa < 0.0
+    ):
+        raise ValueError("fd_adv_residual_rms_kappa must be finite and >= 0")
+    if (
+        args.fd_adv_residual_rms_kappa > 0.0
+        and args.fd_adv_feature_norm_cap > 0.0
+    ):
+        raise ValueError(
+            "--fd_adv_residual_rms_kappa and --fd_adv_feature_norm_cap are mutually exclusive"
+        )
+    if args.fd_adv_residual_rms_kappa > 0.0 and args.fd_adv_backbone != "repr":
+        raise ValueError(
+            "--fd_adv_residual_rms_kappa is only supported with --fd_adv_backbone repr"
+        )
+    if args.fd_adv_residual_rms_kappa > 0.0 and args.fd_adv_inception_random_init:
+        raise ValueError(
+            "--fd_adv_residual_rms_kappa requires a pretrained FD-Adv reference"
+        )
     if args.fd_adv_lora_rank < 0:
         raise ValueError("fd_adv_lora_rank must be >= 0")
     if args.fd_adv_lora_rank > 0 and args.fd_adv_lora_alpha <= 0.0:
@@ -1836,6 +1993,8 @@ def train_and_evaluate(args):
         raise ValueError("fd_adv_log_feature_scale_freq must be >= 1")
     if args.fd_adv_log_feature_cap_fraction_freq < 1:
         raise ValueError("fd_adv_log_feature_cap_fraction_freq must be >= 1")
+    if args.fd_adv_residual_rms_log_freq < 1:
+        raise ValueError("fd_adv_residual_rms_log_freq must be >= 1")
     if not 0.0 <= args.fd_adv_neg_real_degrade_ratio <= 1.0:
         raise ValueError("fd_adv_neg_real_degrade_ratio must be in [0, 1]")
     _validate_fd_sequential_backward_args(args)
@@ -2042,7 +2201,7 @@ def train_and_evaluate(args):
         if args.fd_eigvalsh:
             sigma_ref_sqrt = precompute_sigma_ref_sqrt(sigma_ref)
         judge = {
-            "name": short, "model": repr_model,
+            "name": short, "repr_name": name, "model": repr_model,
             "feat_dim": feat_dim,
             "pool_type": pool_type,
             "inception_layer": inception_layer,
@@ -2115,6 +2274,66 @@ def train_and_evaluate(args):
                 if adv_backbone_label == "repr"
                 else 0.0
             )
+            adv_residual_rms_kappa = (
+                float(args.fd_adv_residual_rms_kappa)
+                if adv_backbone_label == "repr"
+                else 0.0
+            )
+            fd_source_judge = (
+                None if random_adv_init else fd_judges_by_name.get(short)
+            )
+            adv_reference_judge = next(
+                (
+                    candidate
+                    for candidate in judges
+                    if candidate.get("repr_name") == name
+                    and candidate.get("pool_type") == pool_type
+                ),
+                None,
+            )
+            fd_source_index = next(
+                (
+                    idx
+                    for idx, candidate in enumerate(judges)
+                    if candidate is adv_reference_judge
+                ),
+                None,
+            )
+            adv_residual_rms_tau = 0.0
+            if adv_residual_rms_kappa > 0.0:
+                if adv_reference_judge is None:
+                    raise ValueError(
+                        f"FD-Adv residual RMS for '{short}' requires the same "
+                        "pretrained repr in --fd_repr_models"
+                    )
+                if adv_reference_judge.get("pool_type") != pool_type:
+                    raise ValueError(
+                        f"FD-Adv residual RMS for '{short}' requires matching "
+                        "main/adv pool types"
+                    )
+                if int(adv_reference_judge["feat_dim"]) != int(adv_feat_dim):
+                    raise ValueError(
+                        f"FD-Adv residual RMS for '{short}' requires matching "
+                        "main/adv feature dimensions"
+                    )
+                reference_second_moment = (
+                    torch.diagonal(sigma_ref).sum() + mu_ref.square().sum()
+                )
+                if (
+                    not bool(torch.isfinite(reference_second_moment).item())
+                    or float(reference_second_moment) <= 0.0
+                ):
+                    raise ValueError(
+                        f"FD-Adv residual RMS reference scale for '{short}' "
+                        "must be finite and positive"
+                    )
+                adv_residual_rms_tau = (
+                    adv_residual_rms_kappa
+                    * math.sqrt(float(reference_second_moment))
+                )
+                # Initial fake EMA moments must come from the same frozen
+                # reference representation used by the residual transform.
+                fd_source_judge = adv_reference_judge
             adv_lora_modules = 0
             if args.fd_adv_lora_rank > 0:
                 if adv_backbone_label != "repr":
@@ -2159,15 +2378,17 @@ def train_and_evaluate(args):
                 "mu_ref": mu_ref,
                 "sigma_ref": sigma_ref,
                 "weight": weight,
-                "fd_source_judge": (
-                    None if random_adv_init else fd_judges_by_name.get(short)
-                ),
+                "fd_source_judge": fd_source_judge,
+                "adv_reference_judge": adv_reference_judge,
+                "fd_source_index": fd_source_index,
                 "adv_model": adv_model,
                 "adv_optimizer": adv_optimizer,
                 "adv_dim": adv_feat_dim,
                 "adv_backbone": adv_backbone_label,
                 "adv_init_mode": "random" if random_adv_init else "pretrained",
                 "adv_feature_norm_cap": adv_feature_norm_cap,
+                "adv_residual_rms_kappa": adv_residual_rms_kappa,
+                "adv_residual_rms_tau": adv_residual_rms_tau,
                 "adv_max_patches": args.fd_adv_patch_max_patches,
                 "adv_lora_modules": adv_lora_modules,
                 "adv_trainable_params": adv_trainable_param_count,
@@ -2201,6 +2422,8 @@ def train_and_evaluate(args):
                 f"init_mode={adv_judge['adv_init_mode']}, "
                 f"random_init_stats_images={args.fd_adv_random_init_stats_images}, "
                 f"feature_norm_cap={adv_judge['adv_feature_norm_cap']}, "
+                f"residual_rms_kappa={adv_judge['adv_residual_rms_kappa']}, "
+                f"residual_rms_tau={adv_judge['adv_residual_rms_tau']}, "
                 f"repr_weight={weight}, global_weight={args.fd_adv_weight}, lr={args.fd_adv_lr}, "
                 f"steps={args.fd_adv_steps}, grad_clip={args.fd_adv_grad_clip}, "
                 f"update_freq={args.fd_adv_update_freq}, "
@@ -2795,6 +3018,10 @@ def get_args_parser():
                         help="real/fake images used to bootstrap scratch FD-Adv repr moments")
     parser.add_argument("--fd_adv_feature_norm_cap", type=float, default=0.0,
                         help="hard per-sample L2 cap for FD-Adv repr features; 0 disables it")
+    parser.add_argument("--fd_adv_residual_rms_kappa", type=float, default=0.0,
+                        help="bound shared real/fake residual RMS to kappa times frozen-reference RMS; 0 disables")
+    parser.add_argument("--fd_adv_residual_rms_log_freq", type=int, default=100,
+                        help="log shared residual RMS projection metrics every N steps")
     parser.add_argument("--fd_adv_lora_rank", type=int, default=0,
                         help="train only LoRA adapters in repr FD-Adv psi; 0 disables LoRA")
     parser.add_argument("--fd_adv_lora_alpha", type=float, default=64.0,

@@ -38,6 +38,71 @@ def hard_l2_feature_cap(
     return norm_features * scale
 
 
+def shared_residual_rms_projection(
+    adv_real: torch.Tensor,
+    ref_real: torch.Tensor,
+    adv_fake: torch.Tensor,
+    ref_fake: torch.Tensor,
+    tau: float,
+    eps: float = 1e-8,
+):
+    """Smoothly bound the RMS residual of a 50:50 real/fake mixture.
+
+    A single differentiable scalar is shared by real and fake features:
+
+    ``scale = 1 / sqrt(1 + residual_rms2 / tau**2 + eps)``.
+
+    The returned residual mixture therefore has second moment at most
+    ``tau**2``.  Inputs are expected to have already been gathered across all
+    distributed ranks so every rank uses the same global scale.
+    """
+    if not math.isfinite(tau) or tau <= 0.0:
+        raise ValueError("FD-Adv residual RMS tau must be finite and > 0")
+    if not math.isfinite(eps) or eps < 0.0:
+        raise ValueError("FD-Adv residual RMS eps must be finite and >= 0")
+    pairs = (
+        ("real", adv_real, ref_real),
+        ("fake", adv_fake, ref_fake),
+    )
+    for split, adv, ref in pairs:
+        if adv.ndim < 2:
+            raise ValueError(f"FD-Adv {split} features must be at least 2D")
+        if adv.shape != ref.shape:
+            raise ValueError(
+                f"FD-Adv {split} adv/reference feature shapes differ: "
+                f"{tuple(adv.shape)} vs {tuple(ref.shape)}"
+            )
+        if adv.shape[0] == 0:
+            raise ValueError(f"FD-Adv {split} feature batch must be non-empty")
+
+    # Evaluate the trust-region scalar in FP32 for BF16/FP16 feature models.
+    # Do not detach: the critic and generator must see the derivative of the
+    # scale as well as the derivative of the residual itself.
+    compute_dtype = (
+        torch.float32
+        if adv_real.dtype in (torch.float16, torch.bfloat16)
+        else adv_real.dtype
+    )
+    real_delta = adv_real.to(compute_dtype) - ref_real.to(compute_dtype)
+    fake_delta = adv_fake.to(compute_dtype) - ref_fake.to(compute_dtype)
+    real_rms2 = real_delta.square().sum(dim=-1).mean()
+    fake_rms2 = fake_delta.square().sum(dim=-1).mean()
+    residual_rms2 = 0.5 * (real_rms2 + fake_rms2)
+    tau2 = residual_rms2.new_tensor(float(tau) ** 2)
+    raw_ratio = residual_rms2 / tau2
+    scale = torch.rsqrt(1.0 + raw_ratio + float(eps))
+
+    bounded_real = ref_real.to(compute_dtype) + scale * real_delta
+    bounded_fake = ref_fake.to(compute_dtype) + scale * fake_delta
+    bounded_ratio = scale.square() * raw_ratio
+    metrics = {
+        "scale": scale.detach(),
+        "raw_rms_to_tau": raw_ratio.clamp_min(0.0).sqrt().detach(),
+        "bounded_rms_to_tau": bounded_ratio.clamp_min(0.0).sqrt().detach(),
+    }
+    return bounded_real, bounded_fake, metrics
+
+
 class FeatureStatsEMA(torch.nn.Module):
     """EMA moments with differentiable current-batch contribution."""
 
@@ -168,11 +233,9 @@ def save_fd_adv_states(judges):
             "name": judge["name"],
             "init_mode": judge.get("adv_init_mode", "pretrained"),
             "feature_norm_cap": float(judge.get("adv_feature_norm_cap", 0.0)),
-            "feature_transform": (
-                "hard_l2_v1"
-                if float(judge.get("adv_feature_norm_cap", 0.0)) > 0.0
-                else "none"
-            ),
+            "residual_rms_kappa": float(judge.get("adv_residual_rms_kappa", 0.0)),
+            "residual_rms_tau": float(judge.get("adv_residual_rms_tau", 0.0)),
+            "feature_transform": _fd_adv_feature_transform_name(judge),
             "optimizer": optimizer.state_dict(),
         }
         state["model"] = model.state_dict()
@@ -228,9 +291,34 @@ def load_fd_adv_states(judges, saved_states):
                 f"{expected_feature_norm_cap}. Use a separate experiment "
                 "directory or remove the incompatible resume checkpoint."
             )
-        expected_feature_transform = (
-            "hard_l2_v1" if expected_feature_norm_cap > 0.0 else "none"
-        )
+        expected_residual_rms_kappa = float(judge.get("adv_residual_rms_kappa", 0.0))
+        saved_residual_rms_kappa = float(state.get("residual_rms_kappa", 0.0))
+        if not math.isclose(
+            saved_residual_rms_kappa,
+            expected_residual_rms_kappa,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                f"[FD-Adv] Cannot restore '{judge['name']}' with "
+                f"residual_rms_kappa={saved_residual_rms_kappa}; current run "
+                f"expects {expected_residual_rms_kappa}. Use a separate "
+                "experiment directory or remove the incompatible resume checkpoint."
+            )
+        expected_residual_rms_tau = float(judge.get("adv_residual_rms_tau", 0.0))
+        saved_residual_rms_tau = float(state.get("residual_rms_tau", 0.0))
+        if not math.isclose(
+            saved_residual_rms_tau,
+            expected_residual_rms_tau,
+            rel_tol=1e-8,
+            abs_tol=1e-10,
+        ):
+            raise RuntimeError(
+                f"[FD-Adv] Cannot restore '{judge['name']}' with "
+                f"residual_rms_tau={saved_residual_rms_tau}; current run "
+                f"expects {expected_residual_rms_tau}."
+            )
+        expected_feature_transform = _fd_adv_feature_transform_name(judge)
         saved_feature_transform = state.get("feature_transform", "none")
         if saved_feature_transform != expected_feature_transform:
             raise RuntimeError(
@@ -265,3 +353,11 @@ def load_fd_adv_states(judges, saved_states):
         loaded += 1
         logger.info(f"[FD-Adv] Restored adversarial state for '{judge['name']}'")
     return total > 0 and loaded == total
+
+
+def _fd_adv_feature_transform_name(judge):
+    if float(judge.get("adv_residual_rms_kappa", 0.0)) > 0.0:
+        return "smooth_shared_residual_rms_v1"
+    if float(judge.get("adv_feature_norm_cap", 0.0)) > 0.0:
+        return "hard_l2_v1"
+    return "none"
