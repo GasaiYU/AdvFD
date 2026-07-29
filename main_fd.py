@@ -1303,8 +1303,11 @@ def get_fd_train_step(
         )
         if adv_active:
             update_adv_model = (
-                args.fd_adv_update_freq <= 1
-                or (args.current_step - args.fd_adv_start_step) % args.fd_adv_update_freq == 0
+                args.fd_adv_steps > 0
+                and (
+                    args.fd_adv_update_freq <= 1
+                    or (args.current_step - args.fd_adv_start_step) % args.fd_adv_update_freq == 0
+                )
             )
             loss_dict["fd_adv_critic_update"] = float(update_adv_model)
             patch_stats_needed = any(
@@ -2119,6 +2122,8 @@ def train_and_evaluate(args):
         raise ValueError("fd_adv_random_init_stats_images must be >= 1")
     if args.fd_adv_update_freq < 1:
         raise ValueError("fd_adv_update_freq must be >= 1")
+    if args.fd_adv_steps < 0:
+        raise ValueError("fd_adv_steps must be >= 0")
     if args.fd_adv_real_update_freq < 1:
         raise ValueError("fd_adv_real_update_freq must be >= 1")
     if args.fd_adv_log_feature_scale_freq < 1:
@@ -3198,7 +3203,7 @@ def get_args_parser():
     parser.add_argument("--fd_adv_weight_decay", type=float, default=0.0,
                         help="AdamW weight decay for adversarial psi")
     parser.add_argument("--fd_adv_steps", type=int, default=1,
-                        help="number of psi maximization steps per generator step")
+                        help="number of psi maximization steps per generator step; 0 freezes psi")
     parser.add_argument("--fd_adv_update_freq", type=int, default=1,
                         help="update adversarial psi every N generator steps")
     parser.add_argument("--fd_adv_grad_clip", type=float, default=0.0,
