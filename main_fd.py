@@ -1506,6 +1506,7 @@ def get_fd_train_step(
                     real_reference,
                     fake_adv,
                     fake_reference,
+                    split=bool(judge.get("adv_norm_offset_split", False)),
                 )
                 if update_adv_real_stats:
                     real_mu, real_cov = judge["adv_real_stats"].build_stats(
@@ -2095,6 +2096,10 @@ def train_and_evaluate(args):
             "--fd_adv_norm_offset_weight is mutually exclusive with "
             "--fd_adv_residual_rms_kappa and --fd_adv_feature_norm_cap"
         )
+    if args.fd_adv_norm_offset_split and args.fd_adv_norm_offset_weight <= 0.0:
+        raise ValueError(
+            "--fd_adv_norm_offset_split requires --fd_adv_norm_offset_weight > 0"
+        )
     if args.fd_adv_lora_rank < 0:
         raise ValueError("fd_adv_lora_rank must be >= 0")
     if args.fd_adv_lora_rank > 0 and args.fd_adv_lora_alpha <= 0.0:
@@ -2411,6 +2416,9 @@ def train_and_evaluate(args):
                 if adv_backbone_label == "repr"
                 else 0.0
             )
+            adv_norm_offset_split = bool(
+                args.fd_adv_norm_offset_split and adv_backbone_label == "repr"
+            )
             fd_source_judge = (
                 None if random_adv_init else fd_judges_by_name.get(short)
             )
@@ -2533,6 +2541,7 @@ def train_and_evaluate(args):
                 "adv_residual_rms_kappa": adv_residual_rms_kappa,
                 "adv_residual_rms_tau": adv_residual_rms_tau,
                 "adv_norm_offset_weight": adv_norm_offset_weight,
+                "adv_norm_offset_split": adv_norm_offset_split,
                 "adv_max_patches": args.fd_adv_patch_max_patches,
                 "adv_lora_modules": adv_lora_modules,
                 "adv_trainable_params": adv_trainable_param_count,
@@ -2569,6 +2578,7 @@ def train_and_evaluate(args):
                 f"residual_rms_kappa={adv_judge['adv_residual_rms_kappa']}, "
                 f"residual_rms_tau={adv_judge['adv_residual_rms_tau']}, "
                 f"norm_offset_weight={adv_judge['adv_norm_offset_weight']}, "
+                f"norm_offset_split={adv_judge['adv_norm_offset_split']}, "
                 f"repr_weight={weight}, global_weight={args.fd_adv_weight}, lr={args.fd_adv_lr}, "
                 f"steps={args.fd_adv_steps}, grad_clip={args.fd_adv_grad_clip}, "
                 f"update_freq={args.fd_adv_update_freq}, "
@@ -3168,7 +3178,9 @@ def get_args_parser():
     parser.add_argument("--fd_adv_residual_rms_log_freq", type=int, default=100,
                         help="log shared residual RMS projection metrics every N steps")
     parser.add_argument("--fd_adv_norm_offset_weight", type=float, default=0.0,
-                        help="critic penalty weight for shared real/fake feature second-moment drift; 0 disables")
+                        help="critic penalty weight for real/fake feature second-moment drift; 0 disables")
+    parser.add_argument("--fd_adv_norm_offset_split", action="store_true",
+                        help="penalize real and fake feature second-moment ratios separately")
     parser.add_argument("--fd_adv_lora_rank", type=int, default=0,
                         help="train only LoRA adapters in repr FD-Adv psi; 0 disables LoRA")
     parser.add_argument("--fd_adv_lora_alpha", type=float, default=64.0,

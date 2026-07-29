@@ -61,6 +61,32 @@ class SharedFeatureNormOffsetPenaltyTest(unittest.TestCase):
         self.assertEqual(penalty.dtype, torch.float32)
         self.assertEqual(metrics["adv_rms"].dtype, torch.float32)
 
+    def test_split_penalty_catches_real_fake_energy_transfer(self):
+        ref_real = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+        ref_fake = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+        adv_real = torch.zeros_like(ref_real)
+        adv_fake = 2.0 * ref_fake
+
+        shared_penalty, shared_metrics = shared_feature_norm_offset_penalty(
+            adv_real,
+            ref_real,
+            adv_fake,
+            ref_fake,
+        )
+        split_penalty, split_metrics = shared_feature_norm_offset_penalty(
+            adv_real,
+            ref_real,
+            adv_fake,
+            ref_fake,
+            split=True,
+        )
+
+        self.assertAlmostEqual(float(shared_metrics["second_moment_ratio"]), 2.0)
+        self.assertAlmostEqual(float(shared_penalty.detach()), 1.0)
+        self.assertAlmostEqual(float(split_metrics["real_second_moment_ratio"]), 0.0)
+        self.assertAlmostEqual(float(split_metrics["fake_second_moment_ratio"]), 4.0)
+        self.assertAlmostEqual(float(split_penalty.detach()), 5.0)
+
     def test_zero_reference_second_moment_is_rejected(self):
         adv = torch.ones(2, 3)
         ref = torch.zeros(2, 3)

@@ -64,16 +64,16 @@ def shared_residual_rms_projection(
         ("real", adv_real, ref_real),
         ("fake", adv_fake, ref_fake),
     )
-    for split, adv, ref in pairs:
+    for split_name, adv, ref in pairs:
         if adv.ndim < 2:
-            raise ValueError(f"FD-Adv {split} features must be at least 2D")
+            raise ValueError(f"FD-Adv {split_name} features must be at least 2D")
         if adv.shape != ref.shape:
             raise ValueError(
-                f"FD-Adv {split} adv/reference feature shapes differ: "
+                f"FD-Adv {split_name} adv/reference feature shapes differ: "
                 f"{tuple(adv.shape)} vs {tuple(ref.shape)}"
             )
         if adv.shape[0] == 0:
-            raise ValueError(f"FD-Adv {split} feature batch must be non-empty")
+            raise ValueError(f"FD-Adv {split_name} feature batch must be non-empty")
 
     # Evaluate the trust-region scalar in FP32 for BF16/FP16 feature models.
     # Do not detach: the critic and generator must see the derivative of the
@@ -108,28 +108,31 @@ def shared_feature_norm_offset_penalty(
     ref_real: torch.Tensor,
     adv_fake: torch.Tensor,
     ref_fake: torch.Tensor,
+    split: bool = False,
 ):
-    """Penalize drift in the global real/fake feature second moment.
+    """Penalize drift in global real/fake feature second moments.
 
-    The penalty is ``(S_adv / S_ref - 1)**2``, where each second moment is
-    computed on a 50:50 real/fake mixture. Reference inputs are detached so
-    gradients reach only the trainable representation. Inputs are expected to
-    have already been gathered across distributed ranks.
+    With ``split=False`` the penalty is ``(S_adv / S_ref - 1)**2``, where each
+    second moment is computed on a 50:50 real/fake mixture. With ``split=True``
+    it is the average of the independently normalized real and fake penalties.
+    Reference inputs are detached so gradients reach only the trainable
+    representation. Inputs are expected to have already been gathered across
+    distributed ranks.
     """
     pairs = (
         ("real", adv_real, ref_real),
         ("fake", adv_fake, ref_fake),
     )
-    for split, adv, ref in pairs:
+    for split_name, adv, ref in pairs:
         if adv.ndim < 2:
-            raise ValueError(f"FD-Adv {split} features must be at least 2D")
+            raise ValueError(f"FD-Adv {split_name} features must be at least 2D")
         if adv.shape != ref.shape:
             raise ValueError(
-                f"FD-Adv {split} adv/reference feature shapes differ: "
+                f"FD-Adv {split_name} adv/reference feature shapes differ: "
                 f"{tuple(adv.shape)} vs {tuple(ref.shape)}"
             )
         if adv.shape[0] == 0:
-            raise ValueError(f"FD-Adv {split} feature batch must be non-empty")
+            raise ValueError(f"FD-Adv {split_name} feature batch must be non-empty")
 
     compute_dtype = (
         torch.float32
@@ -141,26 +144,56 @@ def shared_feature_norm_offset_penalty(
     ref_real_value = ref_real.detach().to(compute_dtype)
     ref_fake_value = ref_fake.detach().to(compute_dtype)
 
+    adv_real_second_moment = adv_real_value.square().sum(dim=-1).mean()
+    adv_fake_second_moment = adv_fake_value.square().sum(dim=-1).mean()
+    ref_real_second_moment = ref_real_value.square().sum(dim=-1).mean()
+    ref_fake_second_moment = ref_fake_value.square().sum(dim=-1).mean()
+    for split_name, value in (
+        ("real", ref_real_second_moment),
+        ("fake", ref_fake_second_moment),
+    ):
+        if not bool(torch.isfinite(value).item()):
+            raise ValueError(
+                f"FD-Adv {split_name} reference feature second moment must be finite"
+            )
+        if float(value) <= 0.0:
+            raise ValueError(
+                f"FD-Adv {split_name} reference feature second moment must be > 0"
+            )
+    for split_name, value in (
+        ("real", adv_real_second_moment),
+        ("fake", adv_fake_second_moment),
+    ):
+        if not bool(torch.isfinite(value.detach()).item()):
+            raise ValueError(
+                f"FD-Adv {split_name} trainable feature second moment must be finite"
+            )
+
+    real_ratio = adv_real_second_moment / ref_real_second_moment
+    fake_ratio = adv_fake_second_moment / ref_fake_second_moment
     adv_second_moment = 0.5 * (
-        adv_real_value.square().sum(dim=-1).mean()
-        + adv_fake_value.square().sum(dim=-1).mean()
+        adv_real_second_moment + adv_fake_second_moment
     )
     ref_second_moment = 0.5 * (
-        ref_real_value.square().sum(dim=-1).mean()
-        + ref_fake_value.square().sum(dim=-1).mean()
+        ref_real_second_moment + ref_fake_second_moment
     )
     if not bool(torch.isfinite(ref_second_moment).item()):
         raise ValueError("FD-Adv reference feature second moment must be finite")
-    if float(ref_second_moment) <= 0.0:
-        raise ValueError("FD-Adv reference feature second moment must be > 0")
     if not bool(torch.isfinite(adv_second_moment.detach()).item()):
         raise ValueError("FD-Adv trainable feature second moment must be finite")
-
     second_moment_ratio = adv_second_moment / ref_second_moment
-    penalty = (second_moment_ratio - 1.0).square()
+    shared_penalty = (second_moment_ratio - 1.0).square()
+    split_penalty = 0.5 * (
+        (real_ratio - 1.0).square() + (fake_ratio - 1.0).square()
+    )
+    penalty = split_penalty if split else shared_penalty
     metrics = {
         "second_moment_ratio": second_moment_ratio.detach(),
+        "real_second_moment_ratio": real_ratio.detach(),
+        "fake_second_moment_ratio": fake_ratio.detach(),
         "penalty": penalty.detach(),
+        "shared_penalty": shared_penalty.detach(),
+        "split_penalty": split_penalty.detach(),
         "adv_rms": adv_second_moment.clamp_min(0.0).sqrt().detach(),
         "ref_rms": ref_second_moment.clamp_min(0.0).sqrt().detach(),
     }
@@ -300,6 +333,7 @@ def save_fd_adv_states(judges):
             "residual_rms_kappa": float(judge.get("adv_residual_rms_kappa", 0.0)),
             "residual_rms_tau": float(judge.get("adv_residual_rms_tau", 0.0)),
             "norm_offset_weight": float(judge.get("adv_norm_offset_weight", 0.0)),
+            "norm_offset_split": bool(judge.get("adv_norm_offset_split", False)),
             "feature_transform": _fd_adv_feature_transform_name(judge),
             "optimizer": optimizer.state_dict(),
         }
@@ -368,6 +402,17 @@ def load_fd_adv_states(judges, saved_states):
                 f"[FD-Adv] Cannot restore '{judge['name']}' with "
                 f"residual_rms_kappa={saved_residual_rms_kappa}; current run "
                 f"expects {expected_residual_rms_kappa}. Use a separate "
+                "experiment directory or remove the incompatible resume checkpoint."
+            )
+        expected_norm_offset_split = bool(
+            judge.get("adv_norm_offset_split", False)
+        )
+        saved_norm_offset_split = bool(state.get("norm_offset_split", False))
+        if saved_norm_offset_split != expected_norm_offset_split:
+            raise RuntimeError(
+                f"[FD-Adv] Cannot restore '{judge['name']}' with "
+                f"norm_offset_split={saved_norm_offset_split}; current run "
+                f"expects {expected_norm_offset_split}. Use a separate "
                 "experiment directory or remove the incompatible resume checkpoint."
             )
         expected_residual_rms_tau = float(judge.get("adv_residual_rms_tau", 0.0))
