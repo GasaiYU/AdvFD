@@ -29,7 +29,7 @@ export HF_HOME="${HF_HOME:-/mmu-vcg/gaomingju/data/models/}"
 export TORCH_HOME="${TORCH_HOME:-/mmu-vcg/gaomingju/data/models/}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
-: "${CKPT_DIR:=/mmu-vcg/gaomingju/workspace/foundation/FD-Loss-Ours/work_dirs/Jit-adv-ablation/JiT_B-fd-sim-advinc-w0.1-from-base-ADVLR-1e-6/checkpoints}"
+: "${CKPT_DIR:=/mmu-vcg/gaomingju/workspace/foundation/FD-Loss-Ours/work_dirs/Jit-B-adv/JiT_B-fd-inception-advfd-repr-w0.1-pre1000x2000-adv1000-from-base/checkpoints}"
 : "${DATA_ROOT:=/mmu-vcg/zhangxu34/datasets/ImageNet-1K}"
 : "${GPUS_PER_NODE:=8}"
 : "${SPLIT:=train}"
