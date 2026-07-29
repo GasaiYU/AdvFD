@@ -2511,6 +2511,7 @@ def train_and_evaluate(args):
                     ",".join(args.fd_adv_lora_targets),
                     adv_lora_modules,
                 )
+            fd_adv_frozen = args.fd_adv_steps == 0
             _set_fd_adv_requires_grad(adv_model, True)
             adv_model.eval()
             frozen_bn_params = 0
@@ -2527,6 +2528,8 @@ def train_and_evaluate(args):
                 betas=(args.fd_adv_beta1, args.fd_adv_beta2),
                 weight_decay=args.fd_adv_weight_decay,
             )
+            if fd_adv_frozen:
+                _set_requires_grad(adv_model, False)
             adv_judge = {
                 "name": short,
                 "pool_type": pool_type,
@@ -2549,7 +2552,9 @@ def train_and_evaluate(args):
                 "adv_norm_offset_split": adv_norm_offset_split,
                 "adv_max_patches": args.fd_adv_patch_max_patches,
                 "adv_lora_modules": adv_lora_modules,
-                "adv_trainable_params": adv_trainable_param_count,
+                "adv_frozen": fd_adv_frozen,
+                "adv_optimizer_params": adv_trainable_param_count,
+                "adv_trainable_params": 0 if fd_adv_frozen else adv_trainable_param_count,
                 "adv_repr_grad_checkpointing": (
                     bool(getattr(adv_model, "grad_checkpointing", False))
                     if adv_backbone_label == "repr"
@@ -2596,7 +2601,9 @@ def train_and_evaluate(args):
                 f"lora_alpha={args.fd_adv_lora_alpha}, "
                 f"lora_targets={','.join(args.fd_adv_lora_targets)}, "
                 f"lora_modules={adv_judge.get('adv_lora_modules', 0)}, "
+                f"frozen={adv_judge.get('adv_frozen', False)}, "
                 f"trainable_params={adv_judge.get('adv_trainable_params', 0)}, "
+                f"optimizer_params={adv_judge.get('adv_optimizer_params', 0)}, "
                 f"adv_repr_grad_checkpointing={adv_judge.get('adv_repr_grad_checkpointing', False)}, "
                 f"detach_real={args.fd_adv_detach_real}, "
                 f"real_update_freq={args.fd_adv_real_update_freq}, "
