@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
         help="Scale for the RMS-ratio panel (auto uses log for a >=8x span).",
     )
     parser.add_argument(
+        "--max-step",
+        type=int,
+        default=112_500,
+        help="Only include checkpoints up to this training step (default: 112500).",
+    )
+    parser.add_argument(
         "--stats-only",
         action="store_true",
         help="Parse, align, and print statistics without importing matplotlib.",
@@ -150,6 +156,15 @@ def load_points(path: Path) -> list[RMSPoint]:
     if not by_step:
         raise ValueError(f"no RMS results loaded from: {path}")
     return [by_step[step] for step in sorted(by_step)]
+
+
+def limit_points(points: list[RMSPoint], max_step: int, label: str) -> list[RMSPoint]:
+    if max_step < 0:
+        raise ValueError("max_step must be non-negative")
+    limited = [point for point in points if point.step <= max_step]
+    if not limited:
+        raise ValueError(f"{label} input has no checkpoints at or before step {max_step}")
+    return limited
 
 
 def _median(values: list[float]) -> float:
@@ -296,7 +311,6 @@ def make_figure(
     whiten_x = [point.step / step_divisor for point in whiten]
     no_whiten_x = [point.step / step_divisor for point in no_whiten]
     paired_x = [row[0] / step_divisor for row in paired]
-    inflation = [row[3] for row in paired]
 
     all_ratios = [point.ratio for point in whiten] + [point.ratio for point in no_whiten]
     span = max(all_ratios) / min(all_ratios)
@@ -304,11 +318,22 @@ def make_figure(
     if yscale == "auto":
         yscale = "log" if span >= 8.0 else "linear"
 
-    fig, (ax_ratio, ax_inflation) = plt.subplots(
-        1, 2, figsize=(6.75, 2.65), gridspec_kw={"width_ratios": [1.35, 1.0]}
-    )
+    fig, ax_ratio = plt.subplots(figsize=(3.45, 2.65))
 
     ax_ratio.axhline(1.0, color=dark_gray, linestyle=(0, (3, 2)), linewidth=1.0, zorder=1)
+    paired_whiten = [row[1] for row in paired]
+    paired_no_whiten = [row[2] for row in paired]
+    ax_ratio.fill_between(
+        paired_x,
+        paired_whiten,
+        paired_no_whiten,
+        where=[right >= left for left, right in zip(paired_whiten, paired_no_whiten)],
+        color=light_orange,
+        alpha=0.55,
+        interpolate=True,
+        label="RMS inflation",
+        zorder=1,
+    )
     ax_ratio.plot(
         whiten_x,
         [point.ratio for point in whiten],
@@ -333,47 +358,20 @@ def make_figure(
         ylabel += " (log scale)"
     ax_ratio.set_xlabel(step_label)
     ax_ratio.set_ylabel(ylabel)
-    ax_ratio.set_title("(a) RMS ratio across training")
+    ax_ratio.set_title("Whitening prevents RMS inflation")
     ax_ratio.legend(loc="best")
     ax_ratio.xaxis.set_major_locator(MaxNLocator(nbins=6))
-
-    ax_inflation.axhline(
-        1.0, color=dark_gray, linestyle=(0, (3, 2)), linewidth=1.0, zorder=1
-    )
-    ax_inflation.fill_between(
-        paired_x,
-        1.0,
-        inflation,
-        where=[value >= 1.0 for value in inflation],
-        color=light_orange,
-        alpha=0.65,
-        interpolate=True,
-        zorder=1,
-    )
-    ax_inflation.plot(
-        paired_x,
-        inflation,
-        color=vermillion,
-        marker="s",
-        zorder=3,
-    )
-    ax_inflation.set_xlabel(step_label)
-    ax_inflation.set_ylabel("Inflation factor\n(no whitening / whitening)")
-    ax_inflation.set_title("(b) Inflation without whitening")
-    ax_inflation.xaxis.set_major_locator(MaxNLocator(nbins=5))
-    if max(inflation) / min(inflation) >= 8.0:
-        ax_inflation.set_yscale("log")
 
     summary = (
         f"median: {stats['median_inflation_factor']:.2f}×\n"
         f"max: {stats['max_inflation_factor']:.2f}×"
     )
-    ax_inflation.text(
-        0.04,
+    ax_ratio.text(
+        0.97,
         0.95,
         summary,
-        transform=ax_inflation.transAxes,
-        ha="left",
+        transform=ax_ratio.transAxes,
+        ha="right",
         va="top",
         color=vermillion,
         fontsize=8,
@@ -381,7 +379,7 @@ def make_figure(
         bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 2.5},
     )
 
-    fig.tight_layout(w_pad=1.8)
+    fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = output_dir / f"{prefix}.pdf"
     png_path = output_dir / f"{prefix}.png"
@@ -394,13 +392,16 @@ def make_figure(
 def main() -> int:
     args = parse_args()
     try:
-        whiten = load_points(args.whiten)
-        no_whiten = load_points(args.no_whiten)
+        whiten = limit_points(load_points(args.whiten), args.max_step, "whiten")
+        no_whiten = limit_points(
+            load_points(args.no_whiten), args.max_step, "no-whiten"
+        )
         warnings = validate_comparability(whiten, no_whiten)
         paired, stats = align_and_summarize(whiten, no_whiten)
         stats["warnings"] = warnings
         stats["whiten_input"] = str(args.whiten)
         stats["no_whiten_input"] = str(args.no_whiten)
+        stats["max_step"] = args.max_step
 
         print(json.dumps(stats, indent=2, sort_keys=True))
         for warning in warnings:
