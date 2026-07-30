@@ -118,6 +118,13 @@ def _input_files(path: Path) -> list[Path]:
     if not path.is_dir():
         raise ValueError(f"input is neither a file nor a directory: {path}")
 
+    # Per-checkpoint files are the source of truth. summary.jsonl can be stale
+    # when a sweep is interrupted and later resumed, while the step JSON files
+    # still contain all completed checkpoints.
+    step_files = sorted(path.glob("step_*.json"))
+    if step_files:
+        return step_files
+
     summary = path / "summary.jsonl"
     if summary.is_file():
         return [summary]
