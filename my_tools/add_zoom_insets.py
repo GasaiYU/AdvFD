@@ -146,6 +146,11 @@ def _save_atomic(
         temporary.unlink(missing_ok=True)
 
 
+def _default_output_path(input_path: Path) -> Path:
+    suffix = input_path.suffix or ".png"
+    return input_path.with_name(f"{input_path.stem}_1x4{suffix}")
+
+
 def get_args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -154,7 +159,14 @@ def get_args_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help=(
+            "output path; defaults to <input_stem>_1x4.<input_suffix> "
+            "next to the input image"
+        ),
+    )
     parser.add_argument(
         "--roi",
         type=int,
@@ -190,7 +202,11 @@ def get_args_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> None:
     input_path = args.input.expanduser().resolve()
-    output_path = args.output.expanduser().resolve()
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output is not None
+        else _default_output_path(input_path)
+    )
     if not input_path.is_file():
         raise FileNotFoundError(f"Input image not found: {input_path}")
     if input_path == output_path:

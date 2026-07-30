@@ -1,11 +1,29 @@
 import unittest
+from pathlib import Path
 
 from PIL import Image
 
-from my_tools.add_zoom_insets import get_args_parser, make_zoom_strip
+from my_tools.add_zoom_insets import (
+    _default_output_path,
+    get_args_parser,
+    make_zoom_strip,
+)
 
 
 class MakeZoomStripTest(unittest.TestCase):
+    def test_default_output_is_next_to_input(self) -> None:
+        input_path = Path("/images/example.png")
+        self.assertEqual(
+            _default_output_path(input_path),
+            Path("/images/example_1x4.png"),
+        )
+
+    def test_output_argument_is_optional(self) -> None:
+        args = get_args_parser().parse_args(
+            ["--input", "example.png", "--roi", "0", "0", "1", "1"]
+        )
+        self.assertIsNone(args.output)
+
     def test_builds_four_columns_in_expected_order(self) -> None:
         left = Image.new("RGB", (4, 4), "red")
         right = Image.new("RGB", (4, 4), "blue")
