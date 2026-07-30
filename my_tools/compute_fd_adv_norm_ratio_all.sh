@@ -29,7 +29,7 @@ export HF_HOME="${HF_HOME:-/mmu-vcg/gaomingju/data/models/}"
 export TORCH_HOME="${TORCH_HOME:-/mmu-vcg/gaomingju/data/models/}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
-: "${CKPT_DIR:=/mmu-vcg/gaomingju/workspace/foundation/FD-Loss-Ours/work_dirs/Jit-B-adv/JiT_B-fd-inception-advfd-repr-w0.1-pre1000x2000-adv1000-from-base/checkpoints}"
+: "${CKPT_DIR:=/mmu-vcg/gaomingju/workspace/foundation/FD-Loss-Ours/work_dirs/Jit-adv-ablation/JiT_B-fd-sim-advinc-w0.1-from-base-ADVLR-1e-6/checkpoints}"
 : "${DATA_ROOT:=/mmu-vcg/zhangxu34/datasets/ImageNet-1K}"
 : "${GPUS_PER_NODE:=8}"
 : "${SPLIT:=train}"
@@ -38,7 +38,7 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 : "${NUM_WORKERS:=8}"
 : "${REPR_MODEL:=inception}"
 : "${POOL_TYPE:=cls}"
-: "${RESULT_DIR:=$REPO_ROOT/my_tools/fd_adv_norm_ratio_all_no_whiten}"
+: "${RESULT_DIR:=$REPO_ROOT/my_tools/fd_adv_norm_ratio_all}"
 
 shopt -s nullglob
 CKPTS=("$CKPT_DIR"/step_*.pth)
