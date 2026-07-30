@@ -267,8 +267,6 @@ def _step_scale(steps: list[int]) -> tuple[float, str]:
 def make_figure(
     whiten: list[RMSPoint],
     no_whiten: list[RMSPoint],
-    paired: list[tuple[int, float, float, float]],
-    stats: dict[str, Any],
     output_dir: Path,
     prefix: str,
     requested_yscale: str,
@@ -310,14 +308,11 @@ def make_figure(
 
     blue = "#0072B2"
     vermillion = "#D55E00"
-    dark_gray = "#4D4D4D"
-    light_orange = "#F6C8A8"
 
     all_steps = [point.step for point in whiten] + [point.step for point in no_whiten]
     step_divisor, step_label = _step_scale(all_steps)
     whiten_x = [point.step / step_divisor for point in whiten]
     no_whiten_x = [point.step / step_divisor for point in no_whiten]
-    paired_x = [row[0] / step_divisor for row in paired]
 
     all_ratios = [point.ratio for point in whiten] + [point.ratio for point in no_whiten]
     span = max(all_ratios) / min(all_ratios)
@@ -327,20 +322,6 @@ def make_figure(
 
     fig, ax_ratio = plt.subplots(figsize=(3.45, 2.65))
 
-    ax_ratio.axhline(1.0, color=dark_gray, linestyle=(0, (3, 2)), linewidth=1.0, zorder=1)
-    paired_whiten = [row[1] for row in paired]
-    paired_no_whiten = [row[2] for row in paired]
-    ax_ratio.fill_between(
-        paired_x,
-        paired_whiten,
-        paired_no_whiten,
-        where=[right >= left for left, right in zip(paired_whiten, paired_no_whiten)],
-        color=light_orange,
-        alpha=0.55,
-        interpolate=True,
-        label="RMS inflation",
-        zorder=1,
-    )
     ax_ratio.plot(
         whiten_x,
         [point.ratio for point in whiten],
@@ -360,31 +341,19 @@ def make_figure(
         zorder=4,
     )
     ax_ratio.set_yscale(yscale)
-    ylabel = "Adversarial / reference RMS"
-    if yscale == "log":
-        ylabel += " (log scale)"
     ax_ratio.set_xlabel(step_label)
-    ax_ratio.set_ylabel(ylabel)
-    ax_ratio.set_title("Whitening prevents RMS inflation")
-    ax_ratio.legend(loc="best")
+    ax_ratio.set_ylabel(
+        "RMS ratio" if yscale == "linear" else "RMS ratio (log scale)"
+    )
+    ax_ratio.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.01),
+        ncol=2,
+        borderaxespad=0.0,
+        handlelength=2.4,
+        columnspacing=1.2,
+    )
     ax_ratio.xaxis.set_major_locator(MaxNLocator(nbins=6))
-
-    summary = (
-        f"median: {stats['median_inflation_factor']:.2f}×\n"
-        f"max: {stats['max_inflation_factor']:.2f}×"
-    )
-    ax_ratio.text(
-        0.97,
-        0.95,
-        summary,
-        transform=ax_ratio.transAxes,
-        ha="right",
-        va="top",
-        color=vermillion,
-        fontsize=8,
-        fontweight="bold",
-        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 2.5},
-    )
 
     fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -422,8 +391,6 @@ def main() -> int:
         pdf_path, png_path = make_figure(
             whiten,
             no_whiten,
-            paired,
-            stats,
             args.output_dir,
             args.prefix,
             args.yscale,
