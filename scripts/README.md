@@ -140,6 +140,7 @@ export CKPT_ROOT=./checkpoints/base
 | Table 1c, multi-backbone ablation | `bash scripts/table_1c_backbone_combo.sh` |
 | Table 2, JiT-L repurposing | `bash scripts/table_2_repurpose_jit_L.sh` |
 | Table 3, pMF scalability | `MODEL_SIZE=L RES=256 bash scripts/table_3_pMF.sh` |
+| Table 3, pMF adversarial FD, multi-node | `MODEL_SIZE=L RES=256 NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash scripts/table_3_pMF_adv_multi.sh` |
 | Frozen pMF universal pattern | `MODEL_SIZE=B RES=256 bash scripts/table_3_pMF_universal_pattern.sh` |
 | Table 3, iMF scalability | `MODEL_SIZE=L bash scripts/table_3_iMF.sh` |
 | Table 3, JiT scalability | `MODEL_SIZE=L bash scripts/table_3_JiT.sh` |

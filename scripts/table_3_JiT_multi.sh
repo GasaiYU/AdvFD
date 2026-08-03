@@ -27,8 +27,11 @@ set -euo pipefail
 : "${CKPT_ROOT:=./checkpoints/base}"
 : "${OUTPUT_DIR:=/mmu-vcg/gaomingju/workspace/foundation/FD-Loss-Ours/work_dirs}"
 : "${NNODES:=2}"
-: "${NODE_RANK:?Set NODE_RANK to this node's zero-based rank (0..NNODES-1)}"
-: "${MASTER_ADDR:?Set MASTER_ADDR to node 0's reachable IP address or hostname}"
+# Keep these :? messages free of apostrophes: inside "${VAR:?...}" a single quote
+# is still active syntax, so a stray one swallows the following lines and turns
+# the next guard into dead code.
+: "${NODE_RANK:?Set NODE_RANK to the zero-based rank of this node (0..NNODES-1)}"
+: "${MASTER_ADDR:?Set MASTER_ADDR to the reachable IP address or hostname of node 0}"
 : "${MASTER_PORT:=29500}"
 : "${GPUS_PER_NODE:=8}"
 : "${GLOBAL_BSZ:=2048}"
