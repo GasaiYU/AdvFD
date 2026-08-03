@@ -8,10 +8,13 @@ import time
 
 import torch
 import torch.distributed
+import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 
 from utils.builders import create_generation_model, create_tokenizer
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
+from utils.distributed_util import all_reduce_grads
 from utils.distributed_util import all_reduce_mean, preempt_requested, register_preempt_handler
 from utils.distributed_util import broadcast_module_params
 from utils.eval_util import evaluate_all_emas
@@ -163,11 +166,25 @@ def _set_fd_adv_requires_grad(module, requires_grad, freeze_batchnorm=False):
 
 
 def _all_reduce_grads(module):
-    if not torch.distributed.is_initialized():
-        return
-    for p in module.parameters():
-        if p.grad is not None:
-            torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
+    all_reduce_grads(module)
+
+
+class _TrainForward(nn.Module):
+    """Exposes the training forward as ``forward()`` so DDP can hook it.
+
+    The generators drive training through ``sample_images_with_grad``, a custom
+    method. DDP only instruments ``forward()``: calling a custom method on the
+    wrapper raises AttributeError, and calling it on ``.module`` silently
+    bypasses DDP entirely (no bucketing, no overlap, no sync). Routing through
+    this wrapper is what makes DDP take effect.
+    """
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, z, y, sampling_args):
+        return self.module.sample_images_with_grad(z, y, sampling_args=sampling_args)
 
 
 def _check_fd_adv_lora_grads_once(judge):
@@ -223,6 +240,24 @@ def _get_generator_last_layer(model):
     final_layer = getattr(net, "final_layer", None)
     linear = getattr(final_layer, "linear", None)
     return getattr(linear, "weight", None)
+
+
+def _validate_ddp_args(args):
+    if not args.use_ddp:
+        return
+    if args.fd_sequential_backward:
+        raise ValueError(
+            "--use_ddp is incompatible with --fd_sequential_backward: the "
+            "per-judge backward passes would make DDP reduce the same "
+            "gradients more than once. Drop one of the two flags."
+        )
+    if args.num_sampling_steps != 1:
+        raise ValueError(
+            "--use_ddp requires --num_sampling_steps 1: multi-step sampling "
+            f"calls the wrapped forward {args.num_sampling_steps} times before "
+            "one backward, which DDP does not support. Got "
+            f"num_sampling_steps={args.num_sampling_steps}."
+        )
 
 
 def _validate_fd_sequential_backward_args(args):
@@ -1082,6 +1117,7 @@ def get_fd_train_step(
     patch_d_optimizer=None,
     dmd_guidance=None,
     dmd_optimizer=None,
+    ddp_model=None,
 ):
     adv_judges = adv_judges or []
     fid_norm_eps = args.fd_fid_norm_eps
@@ -1113,7 +1149,12 @@ def get_fd_train_step(
             y = torch.randint(0, num_classes, (batch_size,), device="cuda")
             sampling_args.pop("t_start", None)
         sampling_args["return_velocity"] = jit_loss_weight > 0 and args.fd_random_timestep_training
-        sampled = model_wo_ddp.sample_images_with_grad(z, y, sampling_args=sampling_args)
+        if ddp_model is not None:
+            # Goes through DDP.forward so the reducer buckets gradients and
+            # overlaps the all-reduce with backward.
+            sampled = ddp_model(z, y, sampling_args)
+        else:
+            sampled = model_wo_ddp.sample_images_with_grad(z, y, sampling_args=sampling_args)
         if sampling_args["return_velocity"]:
             sampled, velocity_pred = sampled
 
@@ -1996,7 +2037,8 @@ def get_fd_train_step(
         if not args.fd_sequential_backward:
             loss.backward(create_graph=False)
 
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized() and ddp_model is None:
+            # With DDP the reducer already averaged these during backward.
             _all_reduce_grads(model_wo_ddp)
 
         for i, judge in enumerate(judges):
@@ -2135,6 +2177,7 @@ def train_and_evaluate(args):
     if not 0.0 <= args.fd_adv_neg_real_degrade_ratio <= 1.0:
         raise ValueError("fd_adv_neg_real_degrade_ratio must be in [0, 1]")
     _validate_fd_sequential_backward_args(args)
+    _validate_ddp_args(args)
 
     # -- models, optimizer, checkpoint --
     tokenizer = create_tokenizer(args)
@@ -2172,6 +2215,26 @@ def train_and_evaluate(args):
         extra_keys.append("dmd_guidance_state")
     if args.fd_adv_weight > 0:
         extra_keys.append("fd_adv_states")
+
+    # DDP is opt-in. ``model_wo_ddp`` stays the raw module everywhere else so
+    # checkpoints, EMA, sampling, and eval keep their existing state_dict keys.
+    ddp_model = None
+    if args.use_ddp:
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("--use_ddp requires a distributed launch (torchrun)")
+        ddp_model = DistributedDataParallel(
+            _TrainForward(model_wo_ddp),
+            device_ids=[torch.cuda.current_device()],
+            bucket_cap_mb=args.ddp_bucket_cap_mb,
+            # gradient_as_bucket_view is deliberately left off: the training
+            # loop calls zero_grad(set_to_none=True), which detaches the bucket
+            # views every step and negates the saved copy.
+            static_graph=args.ddp_static_graph,
+        )
+        logger.info(
+            f"[DDP] enabled: bucket_cap_mb={args.ddp_bucket_cap_mb}, "
+            f"static_graph={args.ddp_static_graph}"
+        )
 
     optimizer = create_optimizer(args, model_wo_ddp, print_trainable_params=True)
     extra = ckpt_resume(args, model_wo_ddp, optimizer, ema_model,
@@ -2736,6 +2799,7 @@ def train_and_evaluate(args):
         patch_d_optimizer=patch_d_optimizer,
         dmd_guidance=dmd_guidance,
         dmd_optimizer=dmd_optimizer,
+        ddp_model=ddp_model,
     )
 
     # -- training loop --
@@ -3022,6 +3086,21 @@ def get_args_parser():
     parser.add_argument("--ema_halflife_kimg", default=[250, 500, 1000, 2000], type=float, nargs="+")
     parser.add_argument("--ema_sigma_rel", default=[0.05], type=float, nargs="+")
     parser.add_argument("--eval_ema_labels", default=None, type=str, nargs="+")
+
+    parser.add_argument(
+        "--use_ddp",
+        action="store_true",
+        help="wrap the generator in DistributedDataParallel so gradient "
+             "all-reduce is bucketed and overlapped with backward, instead of "
+             "one serial all_reduce per parameter after backward completes",
+    )
+    parser.add_argument("--ddp_bucket_cap_mb", type=int, default=25)
+    parser.add_argument(
+        "--ddp_static_graph",
+        action="store_true",
+        help="assume a fixed set of used parameters each step; slightly faster "
+             "but errors out if the graph varies between steps",
+    )
 
     parser.add_argument("--grad_checkpointing", action="store_true")
     parser.add_argument(
