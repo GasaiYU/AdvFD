@@ -97,11 +97,6 @@ if (( NNODES > 1 )) && [ "$MASTER_ADDR" = "127.0.0.1" ]; then
     exit 1
 fi
 
-OUTPUT_ARGS=()
-if [ -n "${OUTPUT_JSON:-}" ]; then
-    OUTPUT_ARGS=(--output_json "$OUTPUT_JSON")
-fi
-
 echo
 echo "=============================================================="
 echo " Part 2: measured all-reduce bandwidth ($NNODES x $GPUS_PER_NODE GPUs)"
@@ -112,7 +107,9 @@ echo "-- rendezvous: ${MASTER_ADDR}:${MASTER_PORT}  (node_rank=${NODE_RANK}/${NN
 # sit in a 15-minute connect retry.
 if (( NNODES > 1 )); then
     if [ "$NODE_RANK" -eq 0 ]; then
-        echo "-- this is node 0: it hosts the rendezvous. Start the other node(s) now."
+        echo "-- this is node 0: it HOSTS the rendezvous and will block until all"
+        echo "   ${NNODES} nodes have joined. Launch the other node(s) now, in a"
+        echo "   separate shell. Nothing happens here until they arrive."
         if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":${MASTER_PORT} "; then
             echo "[ERR] port ${MASTER_PORT} is already in use on this node." >&2
             echo "      A stale run may still hold it. Pick another MASTER_PORT," >&2
@@ -123,15 +120,23 @@ if (( NNODES > 1 )); then
         # Each attempt must be bounded: a bare /dev/tcp connect to an unroutable
         # address blocks on the OS connect timeout (~75s), overshooting the
         # deadline before it is ever checked.
+        # Enforced in bash rather than via timeout(1)/nc -w, because neither is
+        # present-and-effective on every platform: a blocked connect can
+        # otherwise run to the OS timeout and blow past the deadline.
         probe_master() {
-            if command -v timeout >/dev/null 2>&1; then
-                timeout 3 bash -c \
-                    "exec 3<>/dev/tcp/${MASTER_ADDR}/${MASTER_PORT}" 2>/dev/null
-            elif command -v nc >/dev/null 2>&1; then
-                nc -z -w3 "${MASTER_ADDR}" "${MASTER_PORT}" >/dev/null 2>&1
-            else
-                (exec 3<>"/dev/tcp/${MASTER_ADDR}/${MASTER_PORT}") 2>/dev/null
-            fi
+            (exec 3<>"/dev/tcp/${MASTER_ADDR}/${MASTER_PORT}") 2>/dev/null &
+            local probe_pid=$!
+            local waited=0
+            while kill -0 "$probe_pid" 2>/dev/null; do
+                if [ "$waited" -ge 3 ]; then
+                    kill -9 "$probe_pid" 2>/dev/null
+                    wait "$probe_pid" 2>/dev/null
+                    return 1
+                fi
+                sleep 1
+                waited=$(( waited + 1 ))
+            done
+            wait "$probe_pid" 2>/dev/null
         }
 
         echo "-- waiting up to ${RDZV_TIMEOUT}s for ${MASTER_ADDR}:${MASTER_PORT} ..."
@@ -160,10 +165,68 @@ if (( NNODES > 1 )); then
     fi
 fi
 
-torchrun \
-    --nnodes="$NNODES" \
-    --node_rank="$NODE_RANK" \
-    --master_addr="$MASTER_ADDR" \
-    --master_port="$MASTER_PORT" \
-    --nproc_per_node="$GPUS_PER_NODE" \
-    my_tools/check_nccl_transport.py "${OUTPUT_ARGS[@]}" "$@"
+TORCHRUN_ARGS=(
+    --nnodes="$NNODES"
+    --node_rank="$NODE_RANK"
+    --master_addr="$MASTER_ADDR"
+    --master_port="$MASTER_PORT"
+    --nproc_per_node="$GPUS_PER_NODE"
+    my_tools/check_nccl_transport.py
+)
+if [ -n "${OUTPUT_JSON:-}" ]; then
+    TORCHRUN_ARGS+=(--output_json "$OUTPUT_JSON")
+fi
+
+if (( NNODES <= 1 )); then
+    exec torchrun "${TORCHRUN_ARGS[@]}" "$@"
+fi
+
+# torchrun's static rendezvous waits on a 900s TCPStore timeout, so a missing
+# peer looks like a hang. Cap it: this is a diagnostic, not a training job.
+: "${RDZV_GRACE:=120}"   # extra budget for process startup + the sweep itself
+RDZV_HARD_LIMIT=$(( RDZV_TIMEOUT + RDZV_GRACE ))
+torchrun "${TORCHRUN_ARGS[@]}" "$@" &
+TORCHRUN_PID=$!
+trap 'kill -TERM "$TORCHRUN_PID" 2>/dev/null' INT TERM
+
+waited=0
+while kill -0 "$TORCHRUN_PID" 2>/dev/null; do
+    if [ "$waited" -ge "$RDZV_HARD_LIMIT" ]; then
+        # || true: TERM usually lands first, so kill -9 returns non-zero and
+        # set -e would abort before the diagnosis below is printed.
+        kill -TERM "$TORCHRUN_PID" 2>/dev/null || true
+        sleep 3
+        kill -9 "$TORCHRUN_PID" 2>/dev/null || true
+        echo >&2
+        echo "[ERR] gave up after ${RDZV_HARD_LIMIT}s: rendezvous never completed." >&2
+        echo >&2
+        echo "  All ${NNODES} nodes must run this script at roughly the same time." >&2
+        echo "  If you only started one, that is the reason." >&2
+        echo >&2
+        echo "  Otherwise reuse the MASTER_ADDR/MASTER_PORT your training job uses --" >&2
+        echo "  those are already known to work between these nodes." >&2
+        echo "  Raise the budget with RDZV_TIMEOUT=<seconds> if nodes start far apart." >&2
+        exit 1
+    fi
+    sleep 2
+    waited=$(( waited + 2 ))
+done
+
+set +e
+wait "$TORCHRUN_PID"
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    echo >&2
+    echo "[ERR] torchrun exited with code ${rc} before reporting bandwidth." >&2
+    echo >&2
+    echo "  If the traceback above ends in _rendezvous / TCPStore, the nodes never" >&2
+    echo "  met. Checklist:" >&2
+    echo "    1. Every one of the ${NNODES} nodes must run this script, at roughly" >&2
+    echo "       the same time. Starting only one is the usual cause." >&2
+    echo "    2. MASTER_ADDR=${MASTER_ADDR} must be node 0's address, on a subnet" >&2
+    echo "       both nodes share ('hostname -I' on node 0)." >&2
+    echo "    3. Port ${MASTER_PORT} must be open between them. Reuse the" >&2
+    echo "       MASTER_ADDR/MASTER_PORT from your training job -- known to work." >&2
+    exit "$rc"
+fi

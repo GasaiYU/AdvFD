@@ -1,15 +1,20 @@
-"""Compose eight selected side-by-side pairs into a paper-ready grid.
+"""Compose seven selected side-by-side pairs into a paper-ready grid.
 
 For every source image, the left half is placed in the left block and the
 right half is placed at the corresponding location in the right block.
 The layout follows the requested reference: three large images on the top
-row and five smaller images on the bottom row.
+row and four smaller images on the bottom row.
+
+By default every comparison image in ``--input_dir`` is used, so the
+directory must hold exactly seven of them. Pass ``--filenames`` to pick a
+specific subset and order instead.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -17,16 +22,27 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
-DEFAULT_FILENAMES = [
-    "00734_jit_l_advfd.png",
-    "02091_fd_loss_advfd.png",
-    "07513_fd_loss_advfd.png",
-    "00380_fd_loss_advfd.png",
-    "06805_fd_loss_advfd.png",
-    "07163_fd_loss_advfd.png",
-    "05005_jit_l_advfd.png",
-    "00021_fd_loss_advfd.png",
-]
+TOP_COUNT = 3
+BOTTOM_COUNT = 4
+PANEL_COUNT = TOP_COUNT + BOTTOM_COUNT
+# Both rows must span the same block width, so the width is the smallest
+# common multiple of the two row lengths: 3 top tiles of 4 units each and
+# 4 bottom tiles of 3 units each both span 12 units.
+BLOCK_UNITS = math.lcm(TOP_COUNT, BOTTOM_COUNT)
+TOP_UNITS = BLOCK_UNITS // TOP_COUNT
+BOTTOM_UNITS = BLOCK_UNITS // BOTTOM_COUNT
+BLOCK_HEIGHT_UNITS = TOP_UNITS + BOTTOM_UNITS
+
+IMAGE_SUFFIXES = {
+    ".bmp",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+DEFAULT_OUTPUT_NAME = "selected_7_qualitative_grid.png"
 
 
 def _load_pair(path: Path) -> tuple[Image.Image, Image.Image]:
@@ -82,20 +98,20 @@ def _paste_block(
     origin_y: int,
     unit: int,
 ) -> list[dict[str, int]]:
-    if len(panels) != 8:
-        raise ValueError(f"Expected 8 panels, got {len(panels)}")
+    if len(panels) != PANEL_COUNT:
+        raise ValueError(f"Expected {PANEL_COUNT} panels, got {len(panels)}")
 
     placements: list[dict[str, int]] = []
-    top_size = 5 * unit
-    bottom_size = 3 * unit
+    top_size = TOP_UNITS * unit
+    bottom_size = BOTTOM_UNITS * unit
     for index, panel in enumerate(panels):
-        if index < 3:
+        if index < TOP_COUNT:
             size = top_size
             x = origin_x + index * size
             y = origin_y
         else:
             size = bottom_size
-            x = origin_x + (index - 3) * size
+            x = origin_x + (index - TOP_COUNT) * size
             y = origin_y + top_size
         resized = panel.resize(
             (size, size),
@@ -183,9 +199,9 @@ def compose_grid(
     font_path: Path | None,
     font_size: int,
 ) -> tuple[Image.Image, list[dict[str, object]]]:
-    if len(pair_paths) != 8:
+    if len(pair_paths) != PANEL_COUNT:
         raise ValueError(
-            f"Exactly 8 comparison images are required, got "
+            f"Exactly {PANEL_COUNT} comparison images are required, got "
             f"{len(pair_paths)}"
         )
     if unit <= 0:
@@ -200,8 +216,8 @@ def compose_grid(
     left_panels = [pair[0] for pair in pairs]
     right_panels = [pair[1] for pair in pairs]
 
-    block_width = 15 * unit
-    block_height = 8 * unit
+    block_width = BLOCK_UNITS * unit
+    block_height = BLOCK_HEIGHT_UNITS * unit
     canvas_width = 2 * block_width + group_gap + 2 * outer_padding
     canvas_height = block_height + 2 * outer_padding
     canvas = Image.new(
@@ -267,7 +283,7 @@ def compose_grid(
         layout.append(
             {
                 "position": index,
-                "row": "top" if index < 3 else "bottom",
+                "row": "top" if index < TOP_COUNT else "bottom",
                 "source": str(path),
                 "filename": path.name,
                 "left_box": left_placements[index],
@@ -297,11 +313,32 @@ def _save_image_atomic(
         temporary.unlink(missing_ok=True)
 
 
+def discover_filenames(input_dir: Path, exclude: set[str]) -> list[str]:
+    """Return every comparison image in ``input_dir``, sorted by name."""
+    found = sorted(
+        path.name
+        for path in input_dir.iterdir()
+        if path.is_file()
+        and not path.name.startswith(".")
+        and path.suffix.lower() in IMAGE_SUFFIXES
+        and path.name not in exclude
+    )
+    if len(found) != PANEL_COUNT:
+        preview = ", ".join(found[:12]) or "none"
+        suffix = " ..." if len(found) > 12 else ""
+        raise ValueError(
+            f"{input_dir} holds {len(found)} comparison image(s), but the "
+            f"grid needs exactly {PANEL_COUNT}. Found: {preview}{suffix}. "
+            f"Pass --filenames to select {PANEL_COUNT} of them explicitly."
+        )
+    return found
+
+
 def get_args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a matched 8-image qualitative grid: all left halves "
-            "on the left, all right halves on the right"
+            f"Build a matched {PANEL_COUNT}-image qualitative grid: all left "
+            "halves on the left, all right halves on the right"
         )
     )
     parser.add_argument(
@@ -312,15 +349,16 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--filenames",
         nargs="+",
-        default=DEFAULT_FILENAMES,
-        help="exactly eight filenames relative to --input_dir",
+        default=None,
+        help=(
+            f"exactly {PANEL_COUNT} filenames relative to --input_dir; "
+            "defaults to every comparison image in that directory"
+        ),
     )
     parser.add_argument(
         "--output",
         type=Path,
-        help=(
-            "default: <input_dir>/selected_8_qualitative_grid.png"
-        ),
+        help=f"default: <input_dir>/{DEFAULT_OUTPUT_NAME}",
     )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
@@ -331,8 +369,8 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--unit",
         type=int,
-        default=48,
-        help="layout unit; 48 gives 240px top and 144px bottom tiles",
+        default=60,
+        help="layout unit; 60 gives 240px top and 180px bottom tiles",
     )
     parser.add_argument("--group_gap", type=int, default=36)
     parser.add_argument("--outer_padding", type=int, default=0)
@@ -354,23 +392,36 @@ def run(args: argparse.Namespace) -> None:
     input_dir = args.input_dir.expanduser().resolve()
     if not input_dir.is_dir():
         raise NotADirectoryError(f"Input directory not found: {input_dir}")
-    if len(args.filenames) != 8:
-        raise ValueError(
-            f"--filenames requires exactly 8 entries, got "
-            f"{len(args.filenames)}"
-        )
-    if len(set(args.filenames)) != 8:
-        raise ValueError("--filenames contains duplicates")
     if args.font_size <= 0:
         raise ValueError("--font_size must be positive")
 
-    pair_paths = [input_dir / filename for filename in args.filenames]
     output_path = (
         args.output.expanduser().resolve()
         if args.output is not None
-        else input_dir / "selected_8_qualitative_grid.png"
+        else input_dir / DEFAULT_OUTPUT_NAME
     )
     manifest_path = output_path.with_suffix(".json")
+
+    if args.filenames is None:
+        # A previous grid written into this directory is an output, never a
+        # panel source, so it must not be picked up on a re-run.
+        filenames = discover_filenames(
+            input_dir,
+            exclude={output_path.name}
+            if output_path.parent == input_dir
+            else set(),
+        )
+    else:
+        filenames = list(args.filenames)
+        if len(filenames) != PANEL_COUNT:
+            raise ValueError(
+                f"--filenames requires exactly {PANEL_COUNT} entries, got "
+                f"{len(filenames)}"
+            )
+        if len(set(filenames)) != PANEL_COUNT:
+            raise ValueError("--filenames contains duplicates")
+
+    pair_paths = [input_dir / filename for filename in filenames]
     existing = [
         path for path in (output_path, manifest_path) if path.exists()
     ]
@@ -403,7 +454,13 @@ def run(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "shuffled": not args.preserve_order,
         "source_layout": "left_half | right_half",
-        "grid_layout": "3 large images above 5 small images",
+        "grid_layout": (
+            f"{TOP_COUNT} large images above {BOTTOM_COUNT} small images"
+        ),
+        "num_panels": PANEL_COUNT,
+        "filenames_source": (
+            "input_dir_scan" if args.filenames is None else "explicit"
+        ),
         "left_title": args.left_title if args.show_titles else None,
         "right_title": args.right_title if args.show_titles else None,
         "layout": layout,
