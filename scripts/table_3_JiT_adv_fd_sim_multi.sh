@@ -192,7 +192,7 @@ run_one() {
         "$@"
 }
 
-run_one "${MODEL}-fd-sim-advinc-w${FD_ADV_WEIGHT}-from-${LOAD_INIT}-gbs${GLOBAL_BSZ}-n${NNODES}" \
+run_one "${MODEL}-fd-sim-advinc-w${FD_ADV_WEIGHT}-from-${LOAD_INIT}-gbs${GLOBAL_BSZ}-n${NNODES}-adv-lr-${FD_ADV_LR}" \
     --fd_repr_models "$SIGLIP" "$MAE" inception \
     --fd_repr_pool_types cls cls cls \
     --fd_target_sizes 224 224 256 \
