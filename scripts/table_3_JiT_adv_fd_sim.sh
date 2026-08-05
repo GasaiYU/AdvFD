@@ -24,7 +24,7 @@ set -euo pipefail
 : "${LOAD_INIT:=base}"  # base | fd75k | custom | none
 : "${LOAD_FROM:=}"
 : "${FD_ADV_WEIGHT:=0.1}"
-: "${FD_ADV_LR:=2e-6}"
+: "${FD_ADV_LR:=1e-6}" # Need fixing
 : "${FD_ADV_STEPS:=1}"
 : "${FD_ADV_UPDATE_FREQ:=2}"
 : "${FD_ADV_GRAD_CLIP:=1.0}"
