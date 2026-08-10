@@ -18,6 +18,10 @@ comparable to upstream.  Notable consequences of that fidelity:
   are averaged over ranks at the parameter level instead.
 * AMFD replaces the static FD loss rather than adding to it, and brings its own
   per-encoder normalization instead of ``fid / (fid.detach() + eps)``.
+* The amortizer optimizer shards its state with ZeRO-1 on distributed launches,
+  where upstream uses a replicated ``AdamW``.  This is a memory-layout
+  deviation only; see :func:`_build_amort_optimizer` for why it leaves the
+  update arithmetic alone.
 
 The adversarial FD branch is untouched by everything in this module.
 """
@@ -275,6 +279,66 @@ def _build_feature_normalizer(args, judge, idx):
     return feature_mean, feature_std, source
 
 
+def _zero_optimizer_class():
+    """``ZeroRedundancyOptimizer``, or None on builds that lack it."""
+    try:
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+    except ImportError:
+        return None
+    return ZeroRedundancyOptimizer
+
+
+def _is_zero_optimizer(optimizer):
+    """True when *optimizer* keeps only this rank's shard of the state."""
+    zero_cls = _zero_optimizer_class()
+    return zero_cls is not None and isinstance(optimizer, zero_cls)
+
+
+def _build_amort_optimizer(params, args):
+    """Build the amortizer optimizer, sharding its state when distributed.
+
+    AdamW carries two fp32 moments per parameter.  For the shipped c2048d16a4
+    stack (1114M amortizer parameters over three encoders) that is 8.30 GiB
+    resident on every rank, the largest single block in the step, and plain data
+    parallelism replicates rather than splits it.  ``ZeroRedundancyOptimizer``
+    partitions the moments over the process group, so each rank holds
+    ``1 / world_size`` of them.
+
+    This changes memory layout, not arithmetic.  :func:`update_amortizers`
+    all-reduces amortizer gradients before stepping, so every rank enters
+    ``step()`` with identical gradients and an identical clip scale, updates its
+    own shard exactly as the replicated optimizer would have, and ZeRO then
+    broadcasts the updated parameters.  Every hyperparameter is passed through
+    unchanged.
+
+    A single-process run has no group to shard over and falls back to plain
+    AdamW; so does a build without ``torch.distributed.optim``.
+    """
+    params = list(params)
+    defaults = dict(
+        lr=args.amort_lr,
+        betas=(args.amort_beta1, args.amort_beta2),
+        weight_decay=args.amort_weight_decay,
+    )
+
+    zero_cls = _zero_optimizer_class()
+    if not torch.distributed.is_initialized() or zero_cls is None:
+        logger.info("[AMFD] amortizer optimizer: AdamW (replicated, single process)")
+        return torch.optim.AdamW(params, **defaults)
+
+    optimizer = zero_cls(params, optimizer_class=torch.optim.AdamW, **defaults)
+    world_size = torch.distributed.get_world_size()
+    moment_bytes = sum(p.numel() for p in params) * 8  # exp_avg + exp_avg_sq, fp32
+    logger.info(
+        "[AMFD] amortizer optimizer: ZeRO-1 AdamW over %d rank(s) -- "
+        "moments %.2f GiB replicated -> %.2f GiB per rank",
+        world_size,
+        moment_bytes / 2 ** 30,
+        moment_bytes / world_size / 2 ** 30,
+    )
+    return optimizer
+
+
 def build_amfd_amortizers(judges, args):
     """Attach an amortizer to every AMFD judge and build their optimizer.
 
@@ -337,12 +401,7 @@ def build_amfd_amortizers(judges, args):
             f"ema_decay={args.amort_ema_decay}"
         )
 
-    optimizer_amort = torch.optim.AdamW(
-        amort_modules.parameters(),
-        lr=args.amort_lr,
-        betas=(args.amort_beta1, args.amort_beta2),
-        weight_decay=args.amort_weight_decay,
-    )
+    optimizer_amort = _build_amort_optimizer(amort_modules.parameters(), args)
 
     _load_pretrained_amort_if_requested(amort_judges, args, use_amort_ema)
     _freeze_amort_real_branch_if_requested(amort_judges, args, log=True)
@@ -588,13 +647,43 @@ def amfd_generator_loss(judge, features, labels, args):
     return judge["weight"] * loss, logs
 
 
+def _amort_optimizer_state_dict(optimizer_amort):
+    """Global amortizer optimizer state, or None if this rank does not hold it.
+
+    Under ZeRO each rank owns only its own shard of the moments, so the shards
+    have to be gathered before anything is written.  ``consolidate_state_dict``
+    is a collective: every rank must enter it, and only the ``to=`` rank may
+    then call ``state_dict()`` -- elsewhere that raises.  Non-target ranks
+    therefore return None, which costs nothing because ``save_checkpoint``
+    returns early on every rank but the main one.
+
+    The consolidated dict uses global parameter indexing, so it is
+    interchangeable with a plain AdamW state dict over the same parameters.
+
+    Note that the returned dict holds live references to the moment tensors, so
+    it must be serialized or copied before the optimizer steps again.  The
+    checkpoint path already does: ``save_checkpoint`` either snapshots to CPU
+    for the async saver or hands the dict straight to ``torch.save``.
+    """
+    if not _is_zero_optimizer(optimizer_amort):
+        return optimizer_amort.state_dict()
+
+    optimizer_amort.consolidate_state_dict(to=0)
+    if torch.distributed.get_rank() != 0:
+        return None
+    return optimizer_amort.state_dict()
+
+
 def save_amfd_state(amort_judges, optimizer_amort, args):
-    """Collect AMFD state for the checkpoint. Upstream key layout."""
+    """Collect AMFD state for the checkpoint. Upstream key layout.
+
+    Must be called on every rank, not under a rank-0 guard: the ZeRO shard
+    gather inside :func:`_amort_optimizer_state_dict` is a collective.
+    """
     if not amort_judges:
         return {}
     state = {
         "amort_states": {j["name"]: j["amort"].state_dict() for j in amort_judges},
-        "amort_optimizer": optimizer_amort.state_dict(),
         "amort_metadata": {
             "schema": _AMFD_METADATA_SCHEMA,
             "ema_decay": args.amort_ema_decay,
@@ -606,6 +695,9 @@ def save_amfd_state(amort_judges, optimizer_amort, args):
             "t": args.amort_t,
         },
     }
+    optimizer_state = _amort_optimizer_state_dict(optimizer_amort)
+    if optimizer_state is not None:
+        state["amort_optimizer"] = optimizer_state
     if args.amort_ema_decay > 0.0:
         state["amort_ema_states"] = {
             j["name"]: j["amort_ema"].state_dict() for j in amort_judges
@@ -668,9 +760,38 @@ def load_amfd_state(amort_judges, optimizer_amort, extra, args):
                 judge["amort_ema"].load_state_dict(ema_states[name], strict=True)
             logger.info("[AMFD] Restored amortizer EMA module states")
 
-    if "amort_optimizer" in extra:
-        optimizer_amort.load_state_dict(extra["amort_optimizer"])
-        logger.info("[AMFD] Restored amortizer optimizer state")
+    _load_amort_optimizer_state(optimizer_amort, extra)
+    return True
+
+
+def _load_amort_optimizer_state(optimizer_amort, extra):
+    """Restore the amortizer optimizer state on this rank.
+
+    The checkpoint always holds the *global* state -- consolidated on rank 0 at
+    save time -- and ``ckpt_resume`` loads the file on every rank, so this is a
+    plain per-rank call in both the ZeRO and the replicated case.  ZeRO picks
+    its own shard out of the global dict and drops the rest, which is also what
+    makes resuming onto a different world size work: the partition is recomputed
+    from the new group size.
+
+    A checkpoint saved before ZeRO landed, or written by a single-process run,
+    carries a replicated AdamW dict over the same parameters in the same order;
+    the two layouts share global indexing, so either loads into either.
+
+    ZeRO edits the dict it is handed, replacing the entries this rank does not
+    own with None.  That is safe here: each rank loaded its own copy from disk,
+    nothing else reads ``amort_optimizer`` afterwards, and the checkpoint writer
+    rebuilds its payload from :func:`save_amfd_state` rather than from *extra*.
+    """
+    saved = extra.get("amort_optimizer")
+    if saved is None:
+        logger.warning(
+            "[AMFD] Resume checkpoint has no amortizer optimizer state — "
+            "the amortizer moments start fresh"
+        )
+        return False
+    optimizer_amort.load_state_dict(saved)
+    logger.info("[AMFD] Restored amortizer optimizer state")
     return True
 
 
