@@ -327,7 +327,7 @@ run_one() {
         --auto_resume "$WANDB_FLAG" \
         "${EXTRA[@]}" \
         "$@"
-}
+} 
 
 # -gbs/-n suffix keeps this run's output_dir distinct from the single-node
 # script's, so --auto_resume cannot pick up a checkpoint from a different
