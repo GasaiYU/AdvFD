@@ -68,6 +68,26 @@ export DATA_ROOT="${DATA_ROOT:-/mmu-vcg/zhangxu34/datasets/ImageNet-1K/}"
 : "${MAE:=vit_large_patch16_224.mae}"
 : "${SIGLIP:=vit_so400m_patch16_siglip_256.v2_webli}"
 : "${FD_MAIN_REPRS:=sim}"       # inception | sim
+# Space-separated selectors for --fd_repr_grad_checkpoint_models, matched
+# against each repr's full name and short name. Empty string omits the flag
+# entirely, which turns repr grad checkpointing off for every encoder.
+#
+#   FD_CKPT_MODELS="siglip"      default; SigLIP only
+#   FD_CKPT_MODELS="siglip mae"  both ViTs
+#   FD_CKPT_MODELS=""            off for all reprs
+#   FD_CKPT_MODELS="all"         every repr (see the inception caveat below)
+#
+# Inception cannot checkpoint regardless: load_repr_model's inception branch
+# never forwards grad_checkpointing, so "all" is in effect "siglip mae".
+# This setting is memory-vs-compute only and does not change results, so it is
+# deliberately absent from exp_name -- runs that differ only here can resume
+# from each other.
+# "=" not ":=" on purpose: ":=" substitutes the default for an empty value too,
+# which would make FD_CKPT_MODELS="" silently mean "siglip". With "=" the
+# default applies only when the variable is unset, so an explicit empty string
+# survives and switches repr grad checkpointing off. The assignment form still
+# defines the variable, which set -u requires below.
+: "${FD_CKPT_MODELS=siglip}"
 : "${FD_ADV_REPRS:=inception}"  # follow | inception | sim
 : "${FD_ADV_WEIGHT:=0.05}" # fix 0.05
 : "${FD_ADV_LR:=2e-6}" # fix 2e-6
@@ -173,6 +193,15 @@ if [ "$FD_ADV_UPDATE_FREQ" != "1" ]; then
     FD_ADV_UPDATE_SUFFIX="-advfreq${FD_ADV_UPDATE_FREQ}"
 fi
 
+# Unquoted on purpose: FD_CKPT_MODELS is a space-separated selector list that
+# has to word-split into separate argv entries. --fd_repr_grad_checkpoint_models
+# is nargs="+", so passing the flag with no values is an argparse error; an
+# empty FD_CKPT_MODELS therefore has to drop the flag altogether.
+FD_CKPT_ARGS=()
+if [ -n "$FD_CKPT_MODELS" ]; then
+    FD_CKPT_ARGS=(--fd_repr_grad_checkpoint_models $FD_CKPT_MODELS)
+fi
+
 AMFD_ARGS=()
 AMFD_SUFFIX=
 if [ "$AMFD_STATIC" = "1" ]; then
@@ -264,6 +293,7 @@ CFG="${AMFD_CFG:-1.0}"
 echo "[INFO] node_rank=${NODE_RANK}/${NNODES}, gpus_per_node=${GPUS_PER_NODE}, total_gpus=${TOTAL_GPUS}"
 echo "[INFO] global_batch_size=${GLOBAL_BSZ}, batch_size_per_gpu=${BATCH_SIZE}"
 echo "[INFO] rendezvous=${MASTER_ADDR}:${MASTER_PORT}"
+echo "[INFO] fd_repr_grad_checkpoint_models=${FD_CKPT_MODELS:-<none>}"
 
 run_one() {
     local exp_name="$1"
@@ -290,7 +320,7 @@ run_one() {
         --epochs 100 --steps_per_epoch 1250 --warmup_epochs 1 \
         --lr 1e-6 --lr_sched cosine --min_lr 0.0 \
         --grad_checkpointing \
-        --fd_repr_grad_checkpoint_models siglip \
+        "${FD_CKPT_ARGS[@]}" \
         --fd_eigvalsh --fd_ema_beta 0.999 \
         "${FD_WHITEN_ARGS[@]}" \
         --fd_whiten_eps "$FD_WHITEN_EPS" \
