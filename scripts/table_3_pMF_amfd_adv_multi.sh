@@ -12,11 +12,8 @@
 #                                 unchanged; optimizer arithmetic per step
 #                                 matches the single-node run.
 #
-# One recipe-affecting difference: repr gradient checkpointing defaults to off
-# here, where the single-node script hardcodes "siglip". Halving the per-GPU
-# batch roughly halves activations, so the recompute is usually unnecessary.
-# This is a memory-vs-speed knob and does not change results. Restore the
-# single-node behaviour with FD_CKPT_MODELS="siglip"; see FD_CKPT_MODELS below.
+# Repr gradient checkpointing stays on SigLIP only, as in the single-node
+# script. Configurable via FD_CKPT_MODELS below; memory-vs-speed only.
 #
 # Holding the global batch fixed is the point of this script: the 100x1250-step
 # schedule, the 1e-6 cosine LR, and the FD EMA window all stay comparable with
@@ -26,10 +23,29 @@
 # you want throughput instead of comparability, set GLOBAL_BSZ=2048 to keep 128
 # samples per GPU and accept that the 1e-6 learning rate then needs retuning.
 #
-# AMFD itself is world-size agnostic. update_amortizers all-reduces amortizer
-# gradients before stepping, and the amortizer optimizer is ZeRO-1, so its AdamW
-# moments shard over all 16 ranks instead of 8 -- per-rank amortizer optimizer
-# memory roughly halves relative to the single-node run.
+# AMFD itself is world-size agnostic: update_amortizers all-reduces amortizer
+# gradients before stepping, so every rank steps on identical gradients.
+#
+# ZeRO-1 on the amortizer optimizer is DISABLED here (AMFD_ZERO=0). It is on by
+# default in amfd/integration.py, where it shards the amortizer AdamW moments
+# over the process group. The reason to turn it off is its parameter sync:
+# ZeroRedundancyOptimizer.step() calls _sync_params, which broadcasts each
+# rank's shard back to everyone, and because parameters_as_bucket_view defaults
+# to False it does so one parameter at a time. The shipped c2048d16a4 stack has
+# 297 parameter tensors, so that is 297 x world_size = 4752 broadcasts per
+# amortizer update at 16 ranks, up from 2376 at 8. The byte volume is the same
+# ~4.2 GiB either way, but split across thousands of small collectives it is
+# latency-bound, and the call count grows with world size. all_reduce_grads
+# buckets at 25 MB for exactly this reason; the ZeRO path gets no such
+# treatment.
+#
+# The cost of disabling it: the amortizer AdamW moments go back to being
+# replicated, 8.30 GiB on every rank instead of 8.30/world_size. At 64 samples
+# per GPU there is usually room for that. Set AMFD_ZERO=1 to shard again if a
+# rank OOMs in the optimizer step.
+#
+# Sharding is mathematically equivalent to replicating, so this changes memory
+# and speed only, never results.
 #
 # Launch on every node with the same NNODES, MASTER_ADDR, and MASTER_PORT, and a
 # unique NODE_RANK:
@@ -78,16 +94,10 @@ export DATA_ROOT="${DATA_ROOT:-/mmu-vcg/zhangxu34/datasets/ImageNet-1K/}"
 # against each repr's full name and short name. Empty omits the flag entirely,
 # which turns repr grad checkpointing off for every encoder.
 #
-#   FD_CKPT_MODELS=""            default; off for all reprs
-#   FD_CKPT_MODELS="siglip"      SigLIP only, what the single-node script does
-#   FD_CKPT_MODELS="siglip mae"  both ViTs
+#   FD_CKPT_MODELS="siglip"      default, same as the single-node script
+#   FD_CKPT_MODELS="siglip mae"  both ViTs, if SigLIP alone is not enough
+#   FD_CKPT_MODELS=""            off for all reprs
 #   FD_CKPT_MODELS="all"         every repr (see the inception caveat below)
-#
-# Defaulting to off diverges from the single-node script, which hardcodes
-# "siglip". At 2 nodes the per-GPU batch is 64 rather than 128, so activations
-# roughly halve and SigLIP usually fits without recompute -- trading that memory
-# back for speed is the point. If a repr OOMs, set FD_CKPT_MODELS="siglip"
-# (then "siglip mae") to buy the memory back at the cost of recompute.
 #
 # Inception cannot checkpoint regardless: load_repr_model's inception branch
 # never forwards grad_checkpointing, so "all" is in effect "siglip mae".
@@ -96,8 +106,14 @@ export DATA_ROOT="${DATA_ROOT:-/mmu-vcg/zhangxu34/datasets/ImageNet-1K/}"
 # from each other.
 #
 # "=" not ":=" so that set -u sees a defined variable while an explicit empty
-# value stays empty.
-: "${FD_CKPT_MODELS=}"
+# value stays empty rather than falling back to the default.
+: "${FD_CKPT_MODELS=siglip}"
+# 0 keeps the amortizer AdamW moments replicated instead of sharding them with
+# ZeRO-1; see the header for why that is the default here. Read by
+# add_amfd_args in amfd/integration.py as an env var, so it is exported rather
+# than passed as a flag. AMFD_ZERO=1 restores sharding.
+: "${AMFD_ZERO:=0}"
+export AMFD_ZERO
 : "${FD_ADV_REPRS:=inception}"  # follow | inception | sim
 : "${FD_ADV_WEIGHT:=0.05}" # fix 0.05
 : "${FD_ADV_LR:=2e-6}" # fix 2e-6
@@ -304,6 +320,7 @@ echo "[INFO] node_rank=${NODE_RANK}/${NNODES}, gpus_per_node=${GPUS_PER_NODE}, t
 echo "[INFO] global_batch_size=${GLOBAL_BSZ}, batch_size_per_gpu=${BATCH_SIZE}"
 echo "[INFO] rendezvous=${MASTER_ADDR}:${MASTER_PORT}"
 echo "[INFO] fd_repr_grad_checkpoint_models=${FD_CKPT_MODELS:-<none>}"
+echo "[INFO] AMFD_ZERO=${AMFD_ZERO} (0 = amortizer optimizer state replicated)"
 
 run_one() {
     local exp_name="$1"

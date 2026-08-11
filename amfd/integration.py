@@ -27,6 +27,7 @@ The adversarial FD branch is untouched by everything in this module.
 """
 
 import logging
+import os
 
 import torch
 
@@ -73,6 +74,15 @@ def add_amfd_args(parser):
     group.add_argument("--amort_beta2", type=float, default=0.95)
     group.add_argument("--amort_weight_decay", type=float, default=0.0)
     group.add_argument("--amort_grad_clip", type=float, default=1.0)
+
+    group.add_argument(
+        "--no_amort_zero", action="store_false", dest="amort_zero",
+        default=os.environ.get("AMFD_ZERO", "1") != "0",
+        help="keep the amortizer optimizer state replicated instead of sharding "
+             "it with ZeRO-1. Sharding is mathematically equivalent, so this is "
+             "for isolating ZeRO's communication cost when benchmarking, not for "
+             "changing results. Also settable as AMFD_ZERO=0.",
+    )
 
     group.add_argument("--amort_model_channels", type=int, default=1024)
     group.add_argument("--amort_depth", type=int, default=8)
@@ -322,8 +332,14 @@ def _build_amort_optimizer(params, args):
     )
 
     zero_cls = _zero_optimizer_class()
-    if not torch.distributed.is_initialized() or zero_cls is None:
-        logger.info("[AMFD] amortizer optimizer: AdamW (replicated, single process)")
+    sharding_disabled = not getattr(args, "amort_zero", True)
+    if sharding_disabled or not torch.distributed.is_initialized() or zero_cls is None:
+        reason = (
+            "disabled by --no_amort_zero/AMFD_ZERO=0" if sharding_disabled
+            else "single process" if not torch.distributed.is_initialized()
+            else "torch.distributed.optim unavailable"
+        )
+        logger.info("[AMFD] amortizer optimizer: AdamW (replicated, %s)", reason)
         return torch.optim.AdamW(params, **defaults)
 
     optimizer = zero_cls(params, optimizer_class=torch.optim.AdamW, **defaults)

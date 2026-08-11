@@ -20,10 +20,29 @@
 # you want throughput instead of comparability, set GLOBAL_BSZ=2048 to keep 128
 # samples per GPU and accept that the 1e-5 learning rate then needs retuning.
 #
-# AMFD itself is world-size agnostic. update_amortizers all-reduces amortizer
-# gradients before stepping, and the amortizer optimizer is ZeRO-1, so its AdamW
-# moments shard over all 16 ranks instead of 8 -- per-rank amortizer optimizer
-# memory roughly halves relative to the single-node run.
+# AMFD itself is world-size agnostic: update_amortizers all-reduces amortizer
+# gradients before stepping, so every rank steps on identical gradients.
+#
+# ZeRO-1 on the amortizer optimizer is DISABLED here (AMFD_ZERO=0). It is on by
+# default in amfd/integration.py, where it shards the amortizer AdamW moments
+# over the process group. The reason to turn it off is its parameter sync:
+# ZeroRedundancyOptimizer.step() calls _sync_params, which broadcasts each
+# rank's shard back to everyone, and because parameters_as_bucket_view defaults
+# to False it does so one parameter at a time. The shipped c2048d16a4 stack has
+# 297 parameter tensors, so that is 297 x world_size = 4752 broadcasts per
+# amortizer update at 16 ranks, up from 2376 at 8. The byte volume is the same
+# ~4.2 GiB either way, but split across thousands of small collectives it is
+# latency-bound, and the call count grows with world size. all_reduce_grads
+# buckets at 25 MB for exactly this reason; the ZeRO path gets no such
+# treatment.
+#
+# The cost of disabling it: the amortizer AdamW moments go back to being
+# replicated, 8.30 GiB on every rank instead of 8.30/world_size. At 64 samples
+# per GPU there is usually room for that. Set AMFD_ZERO=1 to shard again if a
+# rank OOMs in the optimizer step.
+#
+# Sharding is mathematically equivalent to replicating, so this changes memory
+# and speed only, never results.
 #
 # Launch on every node with the same NNODES, MASTER_ADDR, and MASTER_PORT, and a
 # unique NODE_RANK:
@@ -66,6 +85,12 @@ set -euo pipefail
 : "${MODEL_SIZE:=B}"
 : "${MAE:=vit_large_patch16_224.mae}"
 : "${SIGLIP:=vit_so400m_patch16_siglip_256.v2_webli}"
+# 0 keeps the amortizer AdamW moments replicated instead of sharding them with
+# ZeRO-1; see the header for why that is the default here. Read by
+# add_amfd_args in amfd/integration.py as an env var, so it is exported rather
+# than passed as a flag. AMFD_ZERO=1 restores sharding.
+: "${AMFD_ZERO:=0}"
+export AMFD_ZERO
 : "${LOAD_INIT:=base}"  # base | fd75k | custom | none
 : "${LOAD_FROM:=}"
 : "${FD_ADV_WEIGHT:=0.1}"
@@ -224,6 +249,7 @@ CFG="${AMFD_CFG:-1.0}"
 echo "[INFO] node_rank=${NODE_RANK}/${NNODES}, gpus_per_node=${GPUS_PER_NODE}, total_gpus=${TOTAL_GPUS}"
 echo "[INFO] global_batch_size=${GLOBAL_BSZ}, batch_size_per_gpu=${BATCH_SIZE}"
 echo "[INFO] rendezvous=${MASTER_ADDR}:${MASTER_PORT}"
+echo "[INFO] AMFD_ZERO=${AMFD_ZERO} (0 = amortizer optimizer state replicated)"
 
 run_one() {
     local exp_name="$1"
