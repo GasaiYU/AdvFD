@@ -12,6 +12,12 @@
 #                                 unchanged; optimizer arithmetic per step
 #                                 matches the single-node run.
 #
+# One recipe-affecting difference: repr gradient checkpointing defaults to off
+# here, where the single-node script hardcodes "siglip". Halving the per-GPU
+# batch roughly halves activations, so the recompute is usually unnecessary.
+# This is a memory-vs-speed knob and does not change results. Restore the
+# single-node behaviour with FD_CKPT_MODELS="siglip"; see FD_CKPT_MODELS below.
+#
 # Holding the global batch fixed is the point of this script: the 100x1250-step
 # schedule, the 1e-6 cosine LR, and the FD EMA window all stay comparable with
 # the single-node numbers. The cost is scaling efficiency. The FD loss
@@ -69,25 +75,29 @@ export DATA_ROOT="${DATA_ROOT:-/mmu-vcg/zhangxu34/datasets/ImageNet-1K/}"
 : "${SIGLIP:=vit_so400m_patch16_siglip_256.v2_webli}"
 : "${FD_MAIN_REPRS:=sim}"       # inception | sim
 # Space-separated selectors for --fd_repr_grad_checkpoint_models, matched
-# against each repr's full name and short name. Empty string omits the flag
-# entirely, which turns repr grad checkpointing off for every encoder.
+# against each repr's full name and short name. Empty omits the flag entirely,
+# which turns repr grad checkpointing off for every encoder.
 #
-#   FD_CKPT_MODELS="siglip"      default; SigLIP only
+#   FD_CKPT_MODELS=""            default; off for all reprs
+#   FD_CKPT_MODELS="siglip"      SigLIP only, what the single-node script does
 #   FD_CKPT_MODELS="siglip mae"  both ViTs
-#   FD_CKPT_MODELS=""            off for all reprs
 #   FD_CKPT_MODELS="all"         every repr (see the inception caveat below)
+#
+# Defaulting to off diverges from the single-node script, which hardcodes
+# "siglip". At 2 nodes the per-GPU batch is 64 rather than 128, so activations
+# roughly halve and SigLIP usually fits without recompute -- trading that memory
+# back for speed is the point. If a repr OOMs, set FD_CKPT_MODELS="siglip"
+# (then "siglip mae") to buy the memory back at the cost of recompute.
 #
 # Inception cannot checkpoint regardless: load_repr_model's inception branch
 # never forwards grad_checkpointing, so "all" is in effect "siglip mae".
 # This setting is memory-vs-compute only and does not change results, so it is
 # deliberately absent from exp_name -- runs that differ only here can resume
 # from each other.
-# "=" not ":=" on purpose: ":=" substitutes the default for an empty value too,
-# which would make FD_CKPT_MODELS="" silently mean "siglip". With "=" the
-# default applies only when the variable is unset, so an explicit empty string
-# survives and switches repr grad checkpointing off. The assignment form still
-# defines the variable, which set -u requires below.
-: "${FD_CKPT_MODELS=siglip}"
+#
+# "=" not ":=" so that set -u sees a defined variable while an explicit empty
+# value stays empty.
+: "${FD_CKPT_MODELS=}"
 : "${FD_ADV_REPRS:=inception}"  # follow | inception | sim
 : "${FD_ADV_WEIGHT:=0.05}" # fix 0.05
 : "${FD_ADV_LR:=2e-6}" # fix 2e-6
