@@ -62,7 +62,7 @@
 # checkpointing break across nodes. CKPT_ROOT and DATA_ROOT must be readable
 # from both nodes.
 #
-# Set AMFD_STATIC=0 to reproduce the plain-FD baseline through this same file.
+# Set AMFD_STATIC=0 to select the plain-FD baseline defaults through this file.
 
 set -euo pipefail
 
@@ -87,6 +87,8 @@ export DATA_ROOT="${DATA_ROOT:-/mmu-vcg/zhangxu34/datasets/ImageNet-1K/}"
 : "${ENABLE_WANDB:=1}"
 : "${MODEL_SIZE:=B}"
 : "${RES:=256}"
+: "${MAIN_WARMUP_EPOCHS:=5}"
+: "${AMFD_STATIC:=1}"
 : "${MAE:=vit_large_patch16_224.mae}"
 : "${SIGLIP:=vit_so400m_patch16_siglip_256.v2_webli}"
 : "${FD_MAIN_REPRS:=sim}"       # inception | sim
@@ -123,23 +125,43 @@ export AMFD_ZERO
 : "${FD_ADV_DETACH_REAL:=1}"
 : "${FD_WHITEN:=0}"
 : "${FD_WHITEN_EPS:=1e-3}" # fix 1e-3
-: "${FD_ADV_START_STEP:=1000}"
 : "${FD_ADV_WARMUP_STEPS:=4000}"
-: "${FD_ADV_WHITEN_EPS:=1e-3}"
 : "${FD_ADV_WHITEN:=1}"
 : "${FD_ADV_NEG_REAL_DEGRADE_RATIO:=0}"
 : "${FD_ADV_LOG_RAW:=1}"
 : "${FD_ADV_LOG_RAW_FREQ:=1000}"
 : "${FD_ADV_EMA_BETA:=0.99}"
+: "${FD_ADV_RESIDUAL_RMS_LOG_FREQ:=100}"
+: "${FD_ADV_LOG_FEATURE_SCALE_FREQ:=20}"
 
-# AMFD on the static FD branch. AMFD_STATIC=0 leaves this script equivalent to
-# the plain-FD baseline. When 1, the static FD loss is replaced by AMFD on every
-# --fd_repr_models entry; the Inception FD-Adv branch is untouched.
+# AMFD needs time to learn a useful static generator gradient before the
+# critic enters. The trust region is the primary long-horizon scale guard;
+# LR warmup and finite checks handle startup and last-resort numerical faults.
+if [ "$AMFD_STATIC" = "1" ]; then
+    : "${FD_ADV_START_STEP:=10000}"
+    : "${FD_ADV_WHITEN_EPS:=5e-3}"
+    : "${FD_ADV_RESIDUAL_RMS_KAPPA:=0.2}"
+    : "${FD_ADV_FREEZE_BATCHNORM:=1}"
+    : "${FD_ADV_LOG_FEATURE_SCALE:=1}"
+    : "${FD_ADV_CRITIC_LR_WARMUP:=1}"
+    : "${FD_ADV_FINITE_GUARD:=1}"
+else
+    : "${FD_ADV_START_STEP:=1000}"
+    : "${FD_ADV_WHITEN_EPS:=1e-3}"
+    : "${FD_ADV_RESIDUAL_RMS_KAPPA:=0}"
+    : "${FD_ADV_FREEZE_BATCHNORM:=0}"
+    : "${FD_ADV_LOG_FEATURE_SCALE:=0}"
+    : "${FD_ADV_CRITIC_LR_WARMUP:=0}"
+    : "${FD_ADV_FINITE_GUARD:=0}"
+fi
+
+# AMFD on the static FD branch. AMFD_STATIC=0 selects the plain-FD baseline
+# defaults. When 1, the static FD loss is replaced by AMFD on every
+# --fd_repr_models entry and the guarded FD-Adv recipe is enabled.
 # Defaults below follow the official AMFD ImageNet launcher
 # (github.com/poppuppy/amfd, scripts/train_imagenet_pmf.sh): c2048/d16/a4,
 # manual JVP, t=0.25, one amortizer update per generator update, and
 # per-encoder generator-loss normalization.
-: "${AMFD_STATIC:=1}"
 : "${AMORT_UNCOND:=1}"   # 1 = AMFD-U. Upstream Table 1 shows conditional is
                          # worse on ImageNet class labels (MSE_mu 5.75 vs
                          # 0.0106 x 1e-3), so AMFD-U is the default here.
@@ -219,6 +241,24 @@ if [ "$FD_ADV_UPDATE_FREQ" != "1" ]; then
     FD_ADV_UPDATE_SUFFIX="-advfreq${FD_ADV_UPDATE_FREQ}"
 fi
 
+FD_ADV_STABILITY_ARGS=(
+    --fd_adv_residual_rms_kappa "$FD_ADV_RESIDUAL_RMS_KAPPA"
+    --fd_adv_residual_rms_log_freq "$FD_ADV_RESIDUAL_RMS_LOG_FREQ"
+    --fd_adv_log_feature_scale_freq "$FD_ADV_LOG_FEATURE_SCALE_FREQ"
+)
+if [ "$FD_ADV_FREEZE_BATCHNORM" = "1" ]; then
+    FD_ADV_STABILITY_ARGS+=(--fd_adv_freeze_batchnorm)
+fi
+if [ "$FD_ADV_LOG_FEATURE_SCALE" = "1" ]; then
+    FD_ADV_STABILITY_ARGS+=(--fd_adv_log_feature_scale)
+fi
+if [ "$FD_ADV_CRITIC_LR_WARMUP" = "1" ]; then
+    FD_ADV_STABILITY_ARGS+=(--fd_adv_critic_lr_warmup)
+fi
+if [ "$FD_ADV_FINITE_GUARD" = "1" ]; then
+    FD_ADV_STABILITY_ARGS+=(--fd_adv_finite_guard)
+fi
+
 # Unquoted on purpose: FD_CKPT_MODELS is a space-separated selector list that
 # has to word-split into separate argv entries. --fd_repr_grad_checkpoint_models
 # is nargs="+", so passing the flag with no values is an argparse error; an
@@ -288,6 +328,13 @@ case "${FD_ADV_REPRS}" in
     *) echo "[ERR] unsupported FD_ADV_REPRS=${FD_ADV_REPRS}"; exit 1 ;;
 esac
 
+if [ "$FD_MAIN_REPRS" = "inception" ] \
+    && [ "$FD_ADV_REPRS" = "sim" ] \
+    && [[ ! "$FD_ADV_RESIDUAL_RMS_KAPPA" =~ ^0+([.][0]+)?([eE][+-]?[0-9]+)?$ ]]; then
+    echo "[ERR] FD_ADV_RESIDUAL_RMS_KAPPA requires matching main reprs; use FD_MAIN_REPRS=sim or set FD_ADV_RESIDUAL_RMS_KAPPA=0" >&2
+    exit 1
+fi
+
 case "${MODEL_SIZE}-${RES}" in
     B-256)
         MODEL=pMF_B; CFG=8.5; INTERVAL_MIN=0.1; INTERVAL_MAX=0.7
@@ -310,11 +357,10 @@ case "${MODEL_SIZE}-${RES}" in
     *) echo "[ERR] unsupported MODEL_SIZE=${MODEL_SIZE} RES=${RES}"; exit 1 ;;
 esac
 
-# Align --cfg with the official AMFD launcher, which uses 1.0 (i.e. no CFG) for
-# both JiT and pMF. The per-model CFG values set above are the FD-Adv
-# baseline's. Set AMFD_CFG to override -- AMFD_CFG=8.5 recovers pMF_B_256's
-# baseline value.
-CFG="${AMFD_CFG:-1.0}"
+# Keep the stable FD-Adv baseline CFG by default. AMFD_CFG remains an explicit
+# override for ablations.
+CFG="${AMFD_CFG:-$CFG}"
+RECIPE_SUFFIX="-cfg${CFG}-mw${MAIN_WARMUP_EPOCHS}-as${FD_ADV_START_STEP}-aw${FD_ADV_WARMUP_STEPS}-aweps${FD_ADV_WHITEN_EPS}-rr${FD_ADV_RESIDUAL_RMS_KAPPA}-fbn${FD_ADV_FREEZE_BATCHNORM}-dlrw${FD_ADV_CRITIC_LR_WARMUP}-fg${FD_ADV_FINITE_GUARD}"
 
 echo "[INFO] node_rank=${NODE_RANK}/${NNODES}, gpus_per_node=${GPUS_PER_NODE}, total_gpus=${TOTAL_GPUS}"
 echo "[INFO] global_batch_size=${GLOBAL_BSZ}, batch_size_per_gpu=${BATCH_SIZE}"
@@ -344,7 +390,7 @@ run_one() {
         --eval_bsz 256 --num_images_for_eval_and_search 50000 \
         --vis_freq 25 --online_eval --eval_freq 1000 \
         --print_freq 20 --milestone_interval 10 --save_freq 5 \
-        --epochs 100 --steps_per_epoch 1250 --warmup_epochs 1 \
+        --epochs 100 --steps_per_epoch 1250 --warmup_epochs "$MAIN_WARMUP_EPOCHS" \
         --lr 1e-6 --lr_sched cosine --min_lr 0.0 \
         --grad_checkpointing \
         "${FD_CKPT_ARGS[@]}" \
@@ -359,7 +405,7 @@ run_one() {
 # -gbs/-n suffix keeps this run's output_dir distinct from the single-node
 # script's, so --auto_resume cannot pick up a checkpoint from a different
 # launcher geometry.
-run_one "${MODEL}_${RES}-${FD_MAIN_TAG}${FD_ADV_TAG}-w${FD_ADV_WEIGHT}${FD_ADV_UPDATE_SUFFIX}${FD_ADV_DETACH_REAL_SUFFIX}${FD_WHITEN_SUFFIX}${FD_ADV_WHITEN_SUFFIX}-${FD_ADV_LR}${AMFD_SUFFIX}-gbs${GLOBAL_BSZ}-n${NNODES}" \
+run_one "${MODEL}_${RES}-${FD_MAIN_TAG}${FD_ADV_TAG}-w${FD_ADV_WEIGHT}${FD_ADV_UPDATE_SUFFIX}${FD_ADV_DETACH_REAL_SUFFIX}${FD_WHITEN_SUFFIX}${FD_ADV_WHITEN_SUFFIX}-${FD_ADV_LR}${AMFD_SUFFIX}${RECIPE_SUFFIX}-gbs${GLOBAL_BSZ}-n${NNODES}" \
     "${FD_REPR_ARGS[@]}" \
     "${FD_ADV_REPR_ARGS[@]}" \
     --fd_adv_weight "$FD_ADV_WEIGHT" \
@@ -368,6 +414,7 @@ run_one "${MODEL}_${RES}-${FD_MAIN_TAG}${FD_ADV_TAG}-w${FD_ADV_WEIGHT}${FD_ADV_U
     --fd_adv_steps "$FD_ADV_STEPS" \
     --fd_adv_update_freq "$FD_ADV_UPDATE_FREQ" \
     --fd_adv_grad_clip "$FD_ADV_GRAD_CLIP" \
+    "${FD_ADV_STABILITY_ARGS[@]}" \
     "${FD_ADV_DETACH_REAL_ARGS[@]}" \
     --fd_adv_start_step "$FD_ADV_START_STEP" \
     --fd_adv_warmup_steps "$FD_ADV_WARMUP_STEPS" \

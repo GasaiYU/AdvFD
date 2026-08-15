@@ -14,7 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from utils.builders import create_generation_model, create_tokenizer
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
-from utils.distributed_util import all_reduce_grads
+from utils.distributed_util import all_reduce_grads, all_ranks_finite, all_ranks_true
 from utils.distributed_util import all_reduce_mean, preempt_requested, register_preempt_handler
 from utils.distributed_util import broadcast_module_params
 from utils.eval_util import evaluate_all_emas
@@ -63,7 +63,7 @@ from amfd import (
     update_amortizers,
 )
 from utils.rng_util import RNGStateManager
-from utils.schedule_util import adjust_learning_rate
+from utils.schedule_util import adjust_learning_rate, linear_warmup_scale
 from utils.setup_util import setup
 from utils.vis_util import visualize
 from models.patch_gan import (
@@ -179,6 +179,11 @@ def _set_fd_adv_requires_grad(module, requires_grad, freeze_batchnorm=False):
 
 def _all_reduce_grads(module):
     all_reduce_grads(module)
+
+
+def _discard_fd_adv_pending_updates(judge):
+    for key in ("_adv_real_update", "_adv_fake_update", "_adv_neg_update"):
+        judge.pop(key, None)
 
 
 class _TrainForward(nn.Module):
@@ -1145,6 +1150,53 @@ def get_fd_train_step(
     if amfd_active and real_batch_fn is None:
         raise RuntimeError("--amfd_static requires a real image dataloader")
 
+    def _connected_nan(*values):
+        anchor = next(
+            (value for value in values if value.requires_grad),
+            values[0],
+        )
+        return (anchor.reshape(-1)[0] * 0.0 + anchor.new_tensor(float("nan"))).float()
+
+    def _compute_fd_adv_from_stats(real_mu, real_cov, fake_mu, fake_cov, whiten):
+        values = (real_mu, real_cov, fake_mu, fake_cov)
+        if args.fd_adv_finite_guard:
+            stats_finite = torch.stack(
+                [torch.isfinite(value).all() for value in values]
+            ).all()
+            if not all_ranks_true(stats_finite):
+                return _connected_nan(*values)
+        try:
+            if not whiten:
+                return compute_frechet_distance_loss(
+                    real_mu,
+                    real_cov,
+                    mu=fake_mu,
+                    sigma=fake_cov,
+                )
+            real_whitening = build_real_whitening(
+                real_mu,
+                real_cov,
+                eps=args.fd_adv_whiten_eps,
+            )
+            return real_whitened_frechet_distance_from_stats(
+                real_mu,
+                real_cov,
+                fake_mu,
+                fake_cov,
+                eps=args.fd_adv_whiten_eps,
+                real_whitening=real_whitening,
+            )
+        except torch.linalg.LinAlgError:
+            if not args.fd_adv_finite_guard:
+                raise
+            if args.rank == 0:
+                logger.warning(
+                    "[step %d] FD-Adv eigendecomposition failed; marking the "
+                    "current critic/generator update non-finite",
+                    args.current_step,
+                )
+            return _connected_nan(*values)
+
     def fd_train_step():
         x0, t_view, noise, velocity_pred = None, None, None, None
         real_images_for_gan = None
@@ -1370,18 +1422,23 @@ def get_fd_train_step(
                 all_new_feats.append(new_feats)
 
         if args.fd_adv_weight > 0:
-            if args.fd_adv_warmup_steps > 0:
-                adv_warmup_progress = (
-                    args.current_step - args.fd_adv_start_step
-                ) / args.fd_adv_warmup_steps
-                fd_adv_warmup = max(0.0, min(1.0, adv_warmup_progress))
-            else:
-                fd_adv_warmup = 1.0 if args.current_step >= args.fd_adv_start_step else 0.0
+            fd_adv_warmup = linear_warmup_scale(
+                args.current_step,
+                args.fd_adv_start_step,
+                args.fd_adv_warmup_steps,
+            )
             fd_adv_effective_weight = args.fd_adv_weight * fd_adv_warmup
+            fd_adv_critic_lr_scale = (
+                fd_adv_warmup if args.fd_adv_critic_lr_warmup else 1.0
+            )
+            fd_adv_critic_lr = args.fd_adv_lr * fd_adv_critic_lr_scale
             loss_dict["fd_adv_warmup"] = float(fd_adv_warmup)
             loss_dict["fd_adv_effective_weight"] = float(fd_adv_effective_weight)
+            loss_dict["fd_adv_critic_lr_scale"] = float(fd_adv_critic_lr_scale)
+            loss_dict["fd_adv_critic_lr"] = float(fd_adv_critic_lr)
         else:
             fd_adv_effective_weight = 0.0
+            fd_adv_critic_lr = 0.0
         real_images_for_adv = None
         update_adv_real_stats = (
             args.fd_adv_real_update_freq <= 1
@@ -1390,6 +1447,7 @@ def get_fd_train_step(
         if adv_active:
             update_adv_model = (
                 args.fd_adv_steps > 0
+                and fd_adv_critic_lr > 0.0
                 and (
                     args.fd_adv_update_freq <= 1
                     or (args.current_step - args.fd_adv_start_step) % args.fd_adv_update_freq == 0
@@ -1621,6 +1679,9 @@ def get_fd_train_step(
                 if adv_model is None or adv_optimizer is None:
                     continue
 
+                for param_group in adv_optimizer.param_groups:
+                    param_group["lr"] = fd_adv_critic_lr
+                judge.pop("_adv_skip_generator_this_step", None)
                 if judge.get("adv_backbone") == "patchgan":
                     adv_model.train()
                 else:
@@ -1638,6 +1699,8 @@ def get_fd_train_step(
                 last_adv_grad_norm = None
                 last_adv_residual_metrics = None
                 last_adv_norm_offset_metrics = None
+                adv_steps_applied = 0
+                adv_nonfinite_skips = 0
                 neg_real_count = 0
                 neg_fake_count = 0
                 for _ in range(args.fd_adv_steps):
@@ -1652,7 +1715,7 @@ def get_fd_train_step(
                             real_images_for_adv,
                             sampled.detach().clamp(0.0, 1.0),
                         )
-                        d_loss.backward()
+                        critic_loss = d_loss
                         last_patch_d_loss = d_loss.detach()
                         last_patch_d_real = d_real.detach().mean()
                         last_patch_d_fake = d_fake.detach().mean()
@@ -1744,24 +1807,13 @@ def get_fd_train_step(
                             )
                         fake_stats = judge.get("adv_neg_stats") or judge["adv_fake_stats"]
                         fake_mu, fake_cov = fake_stats.build_stats(neg_adv)
-                        if args.fd_adv_no_whiten:
-                            adv_fd = compute_frechet_distance_loss(
-                                real_mu,
-                                real_cov,
-                                mu=fake_mu,
-                                sigma=fake_cov,
-                            )
-                        else:
-                            real_whitening = build_real_whitening(
-                                real_mu,
-                                real_cov,
-                                eps=args.fd_adv_whiten_eps,
-                            )
-                            adv_fd = real_whitened_frechet_distance_from_stats(
-                                real_mu, real_cov, fake_mu, fake_cov,
-                                eps=args.fd_adv_whiten_eps,
-                                real_whitening=real_whitening,
-                            )
+                        adv_fd = _compute_fd_adv_from_stats(
+                            real_mu,
+                            real_cov,
+                            fake_mu,
+                            fake_cov,
+                            whiten=not args.fd_adv_no_whiten,
+                        )
                         log_raw_adv_fd = (
                             args.fd_adv_log_raw
                             and args.fd_adv_log_raw_freq > 0
@@ -1771,11 +1823,12 @@ def get_fd_train_step(
                             adv_raw_fd = adv_fd.detach()
                         elif log_raw_adv_fd:
                             with torch.no_grad():
-                                adv_raw_fd = compute_frechet_distance_loss(
+                                adv_raw_fd = _compute_fd_adv_from_stats(
                                     real_mu.detach(),
                                     real_cov.detach(),
-                                    mu=fake_mu.detach(),
-                                    sigma=fake_cov.detach(),
+                                    fake_mu.detach(),
+                                    fake_cov.detach(),
+                                    whiten=False,
                                 )
                         else:
                             adv_raw_fd = None
@@ -1796,7 +1849,30 @@ def get_fd_train_step(
                             last_adv_norm_offset_metrics["weighted_penalty"] = (
                                 weighted_norm_penalty.detach()
                             )
-                        critic_loss.backward()
+                    critic_ready = True
+                    if args.fd_adv_finite_guard:
+                        critic_ready = torch.isfinite(critic_loss.detach()).all()
+                        if not critic_loss.requires_grad:
+                            critic_ready = torch.zeros_like(critic_ready)
+                        critic_ready = all_ranks_true(critic_ready)
+                    if not critic_ready:
+                        adv_nonfinite_skips += 1
+                        judge["_adv_nonfinite_skips_session"] = (
+                            int(judge.get("_adv_nonfinite_skips_session", 0)) + 1
+                        )
+                        judge["_adv_skip_generator_this_step"] = True
+                        _discard_fd_adv_pending_updates(judge)
+                        if args.rank == 0:
+                            logger.warning(
+                                "[step %d] Non-finite or disconnected FD-Adv "
+                                "critic loss for '%s'; "
+                                "skipping D and G-Adv updates",
+                                args.current_step,
+                                judge["name"],
+                            )
+                        break
+
+                    critic_loss.backward()
                     _check_fd_adv_lora_grads_once(judge)
                     _all_reduce_grads(adv_model)
                     if args.fd_adv_grad_clip > 0.0:
@@ -1804,8 +1880,37 @@ def get_fd_train_step(
                             adv_model.parameters(),
                             args.fd_adv_grad_clip,
                         )
+                    elif args.fd_adv_finite_guard:
+                        adv_grad_norm = get_grad_norm(adv_model.parameters())
+                    else:
+                        adv_grad_norm = None
+                    if adv_grad_norm is not None:
                         last_adv_grad_norm = adv_grad_norm.detach()
+                    if (
+                        args.fd_adv_finite_guard
+                        and (
+                            adv_grad_norm is None
+                            or not all_ranks_finite(adv_grad_norm)
+                        )
+                    ):
+                        adv_nonfinite_skips += 1
+                        judge["_adv_nonfinite_skips_session"] = (
+                            int(judge.get("_adv_nonfinite_skips_session", 0)) + 1
+                        )
+                        judge["_adv_skip_generator_this_step"] = True
+                        _discard_fd_adv_pending_updates(judge)
+                        adv_optimizer.zero_grad(set_to_none=True)
+                        if args.rank == 0:
+                            logger.warning(
+                                "[step %d] Non-finite synchronized FD-Adv critic "
+                                "gradients for '%s'; skipping D and G-Adv updates",
+                                args.current_step,
+                                judge["name"],
+                            )
+                        break
+
                     adv_optimizer.step()
+                    adv_steps_applied += 1
                     if adv_fd is not None:
                         last_adv_fd = adv_fd.detach()
                     if adv_raw_fd is not None:
@@ -1817,6 +1922,15 @@ def get_fd_train_step(
                     loss_dict[f"fd_adv_critic_raw_{judge['name']}"] = float(last_adv_raw_fd)
                 if last_adv_grad_norm is not None:
                     loss_dict[f"fd_adv_critic_grad_norm_{judge['name']}"] = float(last_adv_grad_norm)
+                loss_dict[f"fd_adv_critic_steps_applied_{judge['name']}"] = float(
+                    adv_steps_applied
+                )
+                loss_dict[f"fd_adv_critic_nonfinite_skips_{judge['name']}"] = float(
+                    adv_nonfinite_skips
+                )
+                loss_dict[f"fd_adv_critic_nonfinite_skips_session_{judge['name']}"] = float(
+                    judge.get("_adv_nonfinite_skips_session", 0)
+                )
                 if (
                     last_adv_residual_metrics is not None
                     and args.current_step % args.fd_adv_residual_rms_log_freq == 0
@@ -1898,6 +2012,17 @@ def get_fd_train_step(
             for judge in adv_judges:
                 adv_model = judge.get("adv_model")
                 if not (adv_active and adv_model is not None):
+                    continue
+                skip_generator_adv = bool(
+                    judge.pop("_adv_skip_generator_this_step", False)
+                )
+                loss_dict[
+                    f"fd_adv_generator_skipped_nonfinite_{judge['name']}"
+                ] = float(skip_generator_adv)
+                if skip_generator_adv:
+                    _set_requires_grad(adv_model, False)
+                    adv_model.eval()
+                    _discard_fd_adv_pending_updates(judge)
                     continue
                 _set_requires_grad(adv_model, False)
                 adv_model.eval()
@@ -2012,24 +2137,13 @@ def get_fd_train_step(
                             f"fd_adv_feature_scale_fake_to_real_rms_{judge['name']}"
                         ] = fake_rms / max(real_rms, 1e-12)
                 fake_mu, fake_cov = judge["adv_fake_stats"].build_stats(fake_adv)
-                if args.fd_adv_no_whiten:
-                    adv_fd = compute_frechet_distance_loss(
-                        real_mu,
-                        real_cov,
-                        mu=fake_mu,
-                        sigma=fake_cov,
-                    )
-                else:
-                    real_whitening = build_real_whitening(
-                        real_mu,
-                        real_cov,
-                        eps=args.fd_adv_whiten_eps,
-                    )
-                    adv_fd = real_whitened_frechet_distance_from_stats(
-                        real_mu, real_cov, fake_mu, fake_cov,
-                        eps=args.fd_adv_whiten_eps,
-                        real_whitening=real_whitening,
-                    )
+                adv_fd = _compute_fd_adv_from_stats(
+                    real_mu,
+                    real_cov,
+                    fake_mu,
+                    fake_cov,
+                    whiten=not args.fd_adv_no_whiten,
+                )
                 log_raw_adv_fd = (
                     args.fd_adv_log_raw
                     and args.fd_adv_log_raw_freq > 0
@@ -2039,18 +2153,51 @@ def get_fd_train_step(
                     adv_raw_fd = adv_fd.detach()
                 elif log_raw_adv_fd:
                     with torch.no_grad():
-                        adv_raw_fd = compute_frechet_distance_loss(
+                        adv_raw_fd = _compute_fd_adv_from_stats(
                             real_mu.detach(),
                             real_cov.detach(),
-                            mu=fake_mu.detach(),
-                            sigma=fake_cov.detach(),
+                            fake_mu.detach(),
+                            fake_cov.detach(),
+                            whiten=False,
                         )
                 else:
                     adv_raw_fd = None
+                adv_fd_loss = adv_fd / (adv_fd.detach() + fid_norm_eps)
+                if args.fd_adv_finite_guard:
+                    generator_adv_finite = torch.stack(
+                        [
+                            torch.isfinite(value).all()
+                            for value in (
+                                adv_fd,
+                                adv_fd_loss,
+                                fake_adv,
+                                fake_mu,
+                                fake_cov,
+                                real_mu,
+                                real_cov,
+                            )
+                        ]
+                    ).all()
+                    if not adv_fd.requires_grad:
+                        generator_adv_finite = torch.zeros_like(
+                            generator_adv_finite
+                        )
+                    if not all_ranks_true(generator_adv_finite):
+                        _discard_fd_adv_pending_updates(judge)
+                        loss_dict[
+                            f"fd_adv_generator_skipped_nonfinite_{judge['name']}"
+                        ] = 1.0
+                        if args.rank == 0:
+                            logger.warning(
+                                "[step %d] Non-finite FD-Adv generator value for "
+                                "'%s'; skipping G-Adv and all EMA-stat updates",
+                                args.current_step,
+                                judge["name"],
+                            )
+                        continue
                 if real_update is not None:
                     judge["_adv_real_update"] = real_update
                 judge["_adv_fake_update"] = fake_adv.detach()
-                adv_fd_loss = adv_fd / (adv_fd.detach() + fid_norm_eps)
                 loss = loss + fd_adv_effective_weight * judge["weight"] * adv_fd_loss
                 loss_dict[f"fd_adv_{judge['name']}"] = float(adv_fd.detach())
                 if adv_raw_fd is not None:
@@ -2128,6 +2275,31 @@ def get_fd_train_step(
                 real_update = judge.pop("_adv_real_update", None)
                 fake_update = judge.pop("_adv_fake_update", None)
                 neg_update = judge.pop("_adv_neg_update", None)
+                pending_updates = [
+                    update
+                    for update in (real_update, fake_update, neg_update)
+                    if update is not None
+                ]
+                if (
+                    args.fd_adv_finite_guard
+                    and pending_updates
+                    and not all_ranks_true(
+                        torch.stack(
+                            [torch.isfinite(update).all() for update in pending_updates]
+                        )
+                    )
+                ):
+                    loss_dict[
+                        f"fd_adv_stats_skipped_nonfinite_{judge['name']}"
+                    ] = 1.0
+                    if args.rank == 0:
+                        logger.warning(
+                            "[step %d] Non-finite FD-Adv features for '%s'; "
+                            "skipping all EMA-stat updates",
+                            args.current_step,
+                            judge["name"],
+                        )
+                    continue
                 if real_update is not None:
                     judge["adv_real_stats"].update(real_update)
                 if fake_update is not None:
@@ -2176,6 +2348,12 @@ def train_and_evaluate(args):
         raise ValueError("fd_grad_normpreserve_eps must be finite and > 0")
     if args.fd_adv_grad_clip < 0.0:
         raise ValueError("fd_adv_grad_clip must be >= 0")
+    if not math.isfinite(args.fd_adv_lr) or args.fd_adv_lr < 0.0:
+        raise ValueError("fd_adv_lr must be finite and >= 0")
+    if args.fd_adv_start_step < 0:
+        raise ValueError("fd_adv_start_step must be >= 0")
+    if args.fd_adv_warmup_steps < 0:
+        raise ValueError("fd_adv_warmup_steps must be >= 0")
     if (
         not math.isfinite(args.fd_adv_feature_norm_cap)
         or args.fd_adv_feature_norm_cap < 0.0
@@ -2746,7 +2924,9 @@ def train_and_evaluate(args):
                 f"norm_offset_weight={adv_judge['adv_norm_offset_weight']}, "
                 f"norm_offset_split={adv_judge['adv_norm_offset_split']}, "
                 f"repr_weight={weight}, global_weight={args.fd_adv_weight}, lr={args.fd_adv_lr}, "
+                f"critic_lr_warmup={args.fd_adv_critic_lr_warmup}, "
                 f"steps={args.fd_adv_steps}, grad_clip={args.fd_adv_grad_clip}, "
+                f"finite_guard={args.fd_adv_finite_guard}, "
                 f"update_freq={args.fd_adv_update_freq}, "
                 f"whiten_eps={args.fd_adv_whiten_eps}, "
                 f"whiten={not args.fd_adv_no_whiten}, "
@@ -3381,6 +3561,8 @@ def get_args_parser():
                         help="dropout before LoRA A projection for repr FD-Adv psi")
     parser.add_argument("--fd_adv_lr", type=float, default=1e-6,
                         help="learning rate for trainable adversarial psi")
+    parser.add_argument("--fd_adv_critic_lr_warmup", action="store_true",
+                        help="linearly warm the critic optimizer LR over fd_adv_warmup_steps")
     parser.add_argument("--fd_adv_beta1", type=float, default=0.9,
                         help="AdamW beta1 for adversarial psi")
     parser.add_argument("--fd_adv_beta2", type=float, default=0.999,
@@ -3393,6 +3575,8 @@ def get_args_parser():
                         help="update adversarial psi every N generator steps")
     parser.add_argument("--fd_adv_grad_clip", type=float, default=0.0,
                         help="clip adversarial psi gradient norm before optimizer step; 0 disables")
+    parser.add_argument("--fd_adv_finite_guard", action="store_true",
+                        help="skip non-finite critic, generator-Adv, and FD-Adv stats updates")
     parser.add_argument("--fd_adv_freeze_batchnorm", action="store_true",
                         help="keep BatchNorm layers in FD-Adv psi frozen, including affine parameters")
     parser.add_argument("--fd_adv_start_step", type=int, default=1000,

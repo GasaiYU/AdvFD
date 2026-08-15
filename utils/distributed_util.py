@@ -78,6 +78,27 @@ def is_enabled() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def all_ranks_finite(value) -> bool:
+    """Synchronize a finite check so every rank takes the same control path."""
+    if not isinstance(value, torch.Tensor):
+        value = torch.as_tensor(value)
+    return all_ranks_true(torch.isfinite(value.detach()).all())
+
+
+def all_ranks_true(value) -> bool:
+    """Return true only when a boolean condition is true on every rank."""
+    if not isinstance(value, torch.Tensor):
+        value = torch.as_tensor(value)
+    flag = value.detach().bool().all().to(dtype=torch.int32)
+    if is_enabled():
+        if dist.get_backend() == "nccl" and flag.device.type != "cuda":
+            flag = flag.to(
+                device=torch.device("cuda", torch.cuda.current_device())
+            )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
 def get_global_rank() -> int:
     return dist.get_rank() if is_enabled() else 0
 

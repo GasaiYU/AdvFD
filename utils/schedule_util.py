@@ -1,5 +1,14 @@
 import math
 
+
+def linear_warmup_scale(current_step, start_step, warmup_steps):
+    """Return a step-based linear ramp in [0, 1]."""
+    if warmup_steps <= 0:
+        return 1.0 if current_step >= start_step else 0.0
+    progress = (current_step - start_step) / warmup_steps
+    return max(0.0, min(1.0, progress))
+
+
 def adjust_learning_rate(optimizer, step, args):
     """Decay the learning rate with half-cycle cosine after warmup"""
     if step < args.warmup_steps:

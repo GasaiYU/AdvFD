@@ -3,11 +3,11 @@
 # Set MODEL_SIZE in {B,L,H}.
 #
 # AMFD variant of table_3_JiT_adv_fd_sim.sh. Runs main_amfd.py, which replaces
-# the static FD loss with AMFD on every --fd_repr_models entry and leaves the
-# Inception FD-Adv branch untouched. Everything else matches the baseline
-# script, so the two are directly comparable.
+# the static FD loss with AMFD on every --fd_repr_models entry. Baseline CFG and
+# five-epoch generator warmup remain the defaults; AMFD mode additionally uses
+# the guarded FD-Adv recipe assembled below.
 #
-# Set AMFD_STATIC=0 to reproduce the plain-FD baseline through this same file.
+# Set AMFD_STATIC=0 to select the plain-FD baseline defaults through this file.
 
 export HF_HOME=/mmu-vcg/gaomingju/data/models/
 export TORCH_HOME=/mmu-vcg/gaomingju/data/models/
@@ -26,6 +26,8 @@ set -euo pipefail
 : "${GPUS_PER_NODE:=8}"
 : "${GLOBAL_BSZ:=1024}"
 : "${MODEL_SIZE:=B}"
+: "${MAIN_WARMUP_EPOCHS:=5}"
+: "${AMFD_STATIC:=1}"
 : "${MAE:=vit_large_patch16_224.mae}"
 : "${SIGLIP:=vit_so400m_patch16_siglip_256.v2_webli}"
 : "${LOAD_INIT:=base}"  # base | fd75k | custom | none
@@ -38,23 +40,43 @@ set -euo pipefail
 : "${FD_ADV_DETACH_REAL:=1}"
 : "${FD_WHITEN:=0}"
 : "${FD_WHITEN_EPS:=1e-3}"
-: "${FD_ADV_START_STEP:=1000}"
 : "${FD_ADV_WARMUP_STEPS:=4000}"
-: "${FD_ADV_WHITEN_EPS:=1e-3}"
 : "${FD_ADV_WHITEN:=1}"
 : "${FD_ADV_NEG_REAL_DEGRADE_RATIO:=0}"
 : "${FD_ADV_LOG_RAW:=1}"
 : "${FD_ADV_LOG_RAW_FREQ:=1000}"
 : "${FD_ADV_EMA_BETA:=0.99}"
+: "${FD_ADV_RESIDUAL_RMS_LOG_FREQ:=100}"
+: "${FD_ADV_LOG_FEATURE_SCALE_FREQ:=20}"
 
-# AMFD on the static FD branch. AMFD_STATIC=0 leaves this script's behaviour
-# byte-identical to before. When 1, the static FD loss is replaced by AMFD on
-# every --fd_repr_models entry; the Inception FD-Adv branch is untouched.
+# AMFD needs time to learn a useful static generator gradient before the
+# critic enters. The trust region is the primary long-horizon scale guard;
+# LR warmup and finite checks handle startup and last-resort numerical faults.
+if [ "$AMFD_STATIC" = "1" ]; then
+    : "${FD_ADV_START_STEP:=10000}"
+    : "${FD_ADV_WHITEN_EPS:=5e-3}"
+    : "${FD_ADV_RESIDUAL_RMS_KAPPA:=0.2}"
+    : "${FD_ADV_FREEZE_BATCHNORM:=1}"
+    : "${FD_ADV_LOG_FEATURE_SCALE:=1}"
+    : "${FD_ADV_CRITIC_LR_WARMUP:=1}"
+    : "${FD_ADV_FINITE_GUARD:=1}"
+else
+    : "${FD_ADV_START_STEP:=1000}"
+    : "${FD_ADV_WHITEN_EPS:=1e-3}"
+    : "${FD_ADV_RESIDUAL_RMS_KAPPA:=0}"
+    : "${FD_ADV_FREEZE_BATCHNORM:=0}"
+    : "${FD_ADV_LOG_FEATURE_SCALE:=0}"
+    : "${FD_ADV_CRITIC_LR_WARMUP:=0}"
+    : "${FD_ADV_FINITE_GUARD:=0}"
+fi
+
+# AMFD on the static FD branch. AMFD_STATIC=0 selects the plain-FD baseline
+# defaults. When 1, the static FD loss is replaced by AMFD on every
+# --fd_repr_models entry and the guarded FD-Adv recipe is enabled.
 # Defaults below follow the official AMFD ImageNet launcher
 # (github.com/poppuppy/amfd, scripts/train_imagenet_jit.sh): c2048/d16/a4,
 # manual JVP, t=0.25, one amortizer update per generator update, and
 # per-encoder generator-loss normalization.
-: "${AMFD_STATIC:=1}"
 : "${AMORT_UNCOND:=1}"   # 1 = AMFD-U. Upstream Table 1 shows conditional is
                          # worse on ImageNet class labels (MSE_mu 5.75 vs
                          # 0.0106 x 1e-3), so AMFD-U is the default here.
@@ -126,6 +148,24 @@ if [ "$FD_ADV_UPDATE_FREQ" != "1" ]; then
     FD_ADV_UPDATE_SUFFIX="-advfreq${FD_ADV_UPDATE_FREQ}"
 fi
 
+FD_ADV_STABILITY_ARGS=(
+    --fd_adv_residual_rms_kappa "$FD_ADV_RESIDUAL_RMS_KAPPA"
+    --fd_adv_residual_rms_log_freq "$FD_ADV_RESIDUAL_RMS_LOG_FREQ"
+    --fd_adv_log_feature_scale_freq "$FD_ADV_LOG_FEATURE_SCALE_FREQ"
+)
+if [ "$FD_ADV_FREEZE_BATCHNORM" = "1" ]; then
+    FD_ADV_STABILITY_ARGS+=(--fd_adv_freeze_batchnorm)
+fi
+if [ "$FD_ADV_LOG_FEATURE_SCALE" = "1" ]; then
+    FD_ADV_STABILITY_ARGS+=(--fd_adv_log_feature_scale)
+fi
+if [ "$FD_ADV_CRITIC_LR_WARMUP" = "1" ]; then
+    FD_ADV_STABILITY_ARGS+=(--fd_adv_critic_lr_warmup)
+fi
+if [ "$FD_ADV_FINITE_GUARD" = "1" ]; then
+    FD_ADV_STABILITY_ARGS+=(--fd_adv_finite_guard)
+fi
+
 case "${MODEL_SIZE}" in
     B)
         MODEL=JiT_B; CFG=3.0; INTERVAL_MIN=0.1; INTERVAL_MAX=1.0
@@ -145,11 +185,10 @@ case "${MODEL_SIZE}" in
     *) echo "[ERR] unsupported MODEL_SIZE=${MODEL_SIZE}"; exit 1 ;;
 esac
 
-# Align --cfg with the official AMFD launcher, which uses 1.0 (i.e. no CFG) for
-# both JiT and pMF. The per-model CFG values set above are the FD-Adv
-# baseline's. Set AMFD_CFG to override -- AMFD_CFG=3.0 recovers JiT_B's
-# baseline value.
-CFG="${AMFD_CFG:-1.0}"
+# Keep the stable FD-Adv baseline CFG by default. AMFD_CFG remains an explicit
+# override for ablations.
+CFG="${AMFD_CFG:-$CFG}"
+RECIPE_SUFFIX="-cfg${CFG}-mw${MAIN_WARMUP_EPOCHS}-as${FD_ADV_START_STEP}-aw${FD_ADV_WARMUP_STEPS}-aweps${FD_ADV_WHITEN_EPS}-rr${FD_ADV_RESIDUAL_RMS_KAPPA}-fbn${FD_ADV_FREEZE_BATCHNORM}-dlrw${FD_ADV_CRITIC_LR_WARMUP}-fg${FD_ADV_FINITE_GUARD}"
 
 run_one() {
     local exp_name="$1"
@@ -178,7 +217,7 @@ run_one() {
         --eval_bsz 256 --num_images_for_eval_and_search 50000 \
         --vis_freq 100 --online_eval --eval_freq 10000 \
         --print_freq 20 --milestone_interval 10 --save_freq 5 \
-        --epochs 100 --steps_per_epoch 1250 --warmup_epochs 1 \
+        --epochs 100 --steps_per_epoch 1250 --warmup_epochs "$MAIN_WARMUP_EPOCHS" \
         --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
         --grad_checkpointing \
         --fd_repr_grad_checkpoint_models siglip \
@@ -189,7 +228,7 @@ run_one() {
         "$@"
 }
 
-run_one "${MODEL}-fd-sim-advinc-w${FD_ADV_WEIGHT}-from-${LOAD_INIT}-adv-lr-${FD_ADV_LR}${AMFD_SUFFIX}" \
+run_one "${MODEL}-fd-sim-advinc-w${FD_ADV_WEIGHT}-from-${LOAD_INIT}-adv-lr-${FD_ADV_LR}${AMFD_SUFFIX}${RECIPE_SUFFIX}" \
     --fd_repr_models "$SIGLIP" "$MAE" inception \
     --fd_repr_pool_types cls cls cls \
     --fd_target_sizes 224 224 256 \
@@ -200,6 +239,7 @@ run_one "${MODEL}-fd-sim-advinc-w${FD_ADV_WEIGHT}-from-${LOAD_INIT}-adv-lr-${FD_
     --fd_adv_steps "$FD_ADV_STEPS" \
     --fd_adv_update_freq "$FD_ADV_UPDATE_FREQ" \
     --fd_adv_grad_clip "$FD_ADV_GRAD_CLIP" \
+    "${FD_ADV_STABILITY_ARGS[@]}" \
     "${FD_ADV_DETACH_REAL_ARGS[@]}" \
     --fd_adv_start_step "$FD_ADV_START_STEP" \
     --fd_adv_warmup_steps "$FD_ADV_WARMUP_STEPS" \
