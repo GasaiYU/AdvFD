@@ -486,8 +486,10 @@ def _update_module_ema(ema_module, online_module, decay):
 def _accum_log(log_sums: dict, key: str, value, scale: float = 1.0):
     """Upstream ``_accum_log``."""
     if isinstance(value, torch.Tensor):
-        value = float(value.detach())
-    log_sums[key] = log_sums.get(key, 0.0) + float(value) * scale
+        value = value.detach()
+    else:
+        value = float(value)
+    log_sums[key] = log_sums.get(key, 0.0) + value * scale
 
 
 def _extract_judge_features_real_fake(judge, real_images, fake_images):
@@ -641,8 +643,8 @@ def update_amortizers(
     # The generator step must not accumulate into the amortizers.
     _set_requires_grad(amort_modules, False)
 
-    loss_dict["amfd/amort_total"] = float(amort_loss_meter)
-    loss_dict["amfd/grad_norm"] = float(grad_norm_meter)
+    loss_dict["amfd/amort_total"] = amort_loss_meter.detach()
+    loss_dict["amfd/grad_norm"] = grad_norm_meter.detach()
     return amort_loss_meter, grad_norm_meter, loss_dict, labels_for_gen
 
 
@@ -845,4 +847,3 @@ def log_amfd_config(args, amort_judges):
         "[AMFD] the static FD loss is replaced by AMFD; the adversarial FD "
         "branch is unaffected"
     )
-

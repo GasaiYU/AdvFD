@@ -7,6 +7,7 @@ import signal
 import socket
 
 from datetime import timedelta
+from numbers import Real
 
 import torch
 import torch.distributed as dist
@@ -122,6 +123,100 @@ def all_reduce_mean(x):
         dist.all_reduce(t)
         return (t.float() / world_size).item()
     return x
+
+
+def all_reduce_mean_many(values, device=None) -> list[float]:
+    """Average scalar metrics with one packed collective and one host copy.
+
+    All metrics are logging-only values, so they are detached and normalized
+    to FP32 before reduction.  Packing avoids one latency-bound collective and
+    one ``.item()`` synchronization per metric.  The caller must provide the
+    same number and ordering of values on every rank, matching the requirement
+    of the old per-metric reduction loop.
+
+    NCCL reductions use the current CUDA device.  CPU/Gloo is supported for
+    tests and CPU-only distributed jobs.  ``device`` is used for a
+    non-distributed call and as the preferred NCCL device.
+    """
+    values = list(values)
+    if not values:
+        return []
+
+    backend = dist.get_backend() if is_enabled() else None
+    if is_enabled() and backend == "nccl":
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL metric reduction requires CUDA")
+        reduce_device = torch.device(
+            device if device is not None else
+            torch.device("cuda", torch.cuda.current_device())
+        )
+        if reduce_device.type != "cuda":
+            reduce_device = torch.device("cuda", torch.cuda.current_device())
+    elif is_enabled():
+        # Gloo metrics are tiny; keeping them on CPU also makes this helper
+        # usable in CPU-only distributed regression tests.
+        reduce_device = torch.device("cpu")
+    elif device is not None:
+        reduce_device = torch.device(device)
+    else:
+        reduce_device = next(
+            (
+                value.device
+                for value in values
+                if isinstance(value, torch.Tensor) and value.device.type == "cuda"
+            ),
+            torch.device("cpu"),
+        )
+
+    host_values = []
+    tensor_indices = []
+    tensor_values = []
+    for index, value in enumerate(values):
+        if isinstance(value, torch.Tensor):
+            if value.layout != torch.strided or value.numel() != 1:
+                raise ValueError(
+                    "all_reduce_mean_many expects dense scalar tensors; "
+                    f"value {index} has layout={value.layout}, shape={tuple(value.shape)}"
+                )
+            if value.is_complex():
+                raise TypeError("complex metrics are not supported")
+            host_values.append(0.0)
+            tensor_indices.append(index)
+            tensor_values.append(value.detach().reshape(()))
+        elif isinstance(value, Real):
+            host_values.append(float(value))
+        else:
+            raise TypeError(
+                "all_reduce_mean_many expects real numbers or scalar tensors; "
+                f"value {index} has type {type(value).__name__}"
+            )
+
+    packed = torch.tensor(host_values, dtype=torch.float32, device=reduce_device)
+    if tensor_values:
+        indices = torch.tensor(
+            tensor_indices,
+            dtype=torch.long,
+            device=reduce_device,
+        )
+        source_devices = {value.device for value in tensor_values}
+        if len(source_devices) == 1:
+            # Stack before changing devices so CUDA+Gloo also performs one
+            # device-to-host copy rather than one copy per metric.
+            packed_tensors = torch.stack([
+                value.to(dtype=torch.float32) for value in tensor_values
+            ]).to(device=reduce_device)
+        else:
+            packed_tensors = torch.stack([
+                value.to(device=reduce_device, dtype=torch.float32)
+                for value in tensor_values
+            ])
+        packed.index_copy_(0, indices, packed_tensors)
+
+    world_size = get_world_size()
+    if world_size > 1:
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        packed.div_(world_size)
+    return packed.cpu().tolist()
 
 
 def concat_all_gather(tensor, gather_dim=0) -> torch.Tensor:

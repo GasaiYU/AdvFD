@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import hashlib
 import logging
 import math
 import os
@@ -14,8 +15,12 @@ from torch.nn.parallel import DistributedDataParallel
 
 from utils.builders import create_generation_model, create_tokenizer
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
-from utils.distributed_util import all_reduce_grads, all_ranks_finite, all_ranks_true
-from utils.distributed_util import all_reduce_mean, preempt_requested, register_preempt_handler
+from utils.distributed_util import all_reduce_grads, all_ranks_true
+from utils.distributed_util import (
+    all_reduce_mean_many,
+    preempt_requested,
+    register_preempt_handler,
+)
 from utils.distributed_util import broadcast_module_params
 from utils.eval_util import evaluate_all_emas
 from utils.grad_util import apply_batch_gradient_normpreserve, get_grad_norm
@@ -460,7 +465,9 @@ def _adv_feature_scale_stats(features, feature_norm_cap=0.0):
             l2_norms.new_tensor(float(feature_norm_cap)),
             (l2_norms >= float(feature_norm_cap) * (1.0 - 1e-6)).float().mean(),
         ))
-    return dict(zip(stat_names, torch.stack(stat_values).cpu().tolist()))
+    # Keep diagnostics on device.  The training loop batches them with the
+    # other scalar metrics and performs a single host transfer at log time.
+    return dict(zip(stat_names, torch.stack(stat_values).unbind()))
 
 
 @torch.no_grad()
@@ -475,13 +482,13 @@ def _adv_pre_cap_norm_stats(norms, feature_norm_cap):
         norms.new_tensor([0.95, 0.99]),
     )
     return {
-        "l2_mean": float(norms.mean()),
-        "l2_p95": float(quantiles[0]),
-        "l2_p99": float(quantiles[1]),
-        "l2_max": float(norms.max()),
-        "norm_cap_fraction": float((norms > cap).float().mean()),
-        "radial_scale_mean": float(scales.mean()),
-        "radial_scale_min": float(scales.min()),
+        "l2_mean": norms.mean(),
+        "l2_p95": quantiles[0],
+        "l2_p99": quantiles[1],
+        "l2_max": norms.max(),
+        "norm_cap_fraction": (norms > cap).float().mean(),
+        "radial_scale_mean": scales.mean(),
+        "radial_scale_min": scales.min(),
     }
 
 
@@ -1163,7 +1170,12 @@ def get_fd_train_step(
             stats_finite = torch.stack(
                 [torch.isfinite(value).all() for value in values]
             ).all()
-            if not all_ranks_true(stats_finite):
+            # Do not rendezvous here.  A bad rank returns a connected NaN and
+            # every caller reaches its phase-level synchronized readiness
+            # check before backward/optimizer/EMA state can be mutated.  This
+            # keeps non-finite inputs out of the eigensolver while folding the
+            # global decision into the existing D- or G-commit barrier.
+            if not bool(stats_finite.item()):
                 return _connected_nan(*values)
         try:
             if not whiten:
@@ -1326,9 +1338,9 @@ def get_fd_train_step(
             )
             if patch_adv_pretrain is not None:
                 adv_pre_loss, adv_pre_real, adv_pre_fake = patch_adv_pretrain
-                loss_dict["fd_adv_patch_pretrain_loss"] = float(adv_pre_loss)
-                loss_dict["fd_adv_patch_pretrain_real"] = float(adv_pre_real)
-                loss_dict["fd_adv_patch_pretrain_fake"] = float(adv_pre_fake)
+                loss_dict["fd_adv_patch_pretrain_loss"] = adv_pre_loss.detach()
+                loss_dict["fd_adv_patch_pretrain_real"] = adv_pre_real.detach()
+                loss_dict["fd_adv_patch_pretrain_fake"] = adv_pre_fake.detach()
 
         loss = torch.tensor(0.0, device="cuda")
 
@@ -1737,11 +1749,12 @@ def get_fd_train_step(
                                     _extract_adv_features(judge, sampled.detach())
                                 )
                                 fake_mu, fake_cov = judge["adv_fake_stats"].build_stats(fake_adv)
-                                adv_fd = compute_frechet_distance_loss(
+                                adv_fd = _compute_fd_adv_from_stats(
                                     real_mu.detach(),
                                     real_cov.detach(),
-                                    mu=fake_mu.detach(),
-                                    sigma=fake_cov.detach(),
+                                    fake_mu.detach(),
+                                    fake_cov.detach(),
+                                    whiten=False,
                                 )
                                 adv_raw_fd = adv_fd.detach()
                                 last_adv_fd = adv_fd.detach()
@@ -1851,10 +1864,25 @@ def get_fd_train_step(
                             )
                     critic_ready = True
                     if args.fd_adv_finite_guard:
-                        critic_ready = torch.isfinite(critic_loss.detach()).all()
-                        if not critic_loss.requires_grad:
-                            critic_ready = torch.zeros_like(critic_ready)
-                        critic_ready = all_ranks_true(critic_ready)
+                        readiness = [
+                            torch.isfinite(critic_loss.detach()).all(),
+                            critic_loss.new_tensor(
+                                critic_loss.requires_grad,
+                                dtype=torch.bool,
+                            ),
+                        ]
+                        # A finite norm-offset penalty must not hide a
+                        # disconnected/non-finite FD objective.  PatchGAN's
+                        # raw FD is diagnostic only, so it remains excluded.
+                        if not patch_hinge_update:
+                            readiness.extend([
+                                torch.isfinite(adv_fd.detach()).all(),
+                                adv_fd.new_tensor(
+                                    adv_fd.requires_grad,
+                                    dtype=torch.bool,
+                                ),
+                            ])
+                        critic_ready = all_ranks_true(torch.stack(readiness))
                     if not critic_ready:
                         adv_nonfinite_skips += 1
                         judge["_adv_nonfinite_skips_session"] = (
@@ -1886,13 +1914,34 @@ def get_fd_train_step(
                         adv_grad_norm = None
                     if adv_grad_norm is not None:
                         last_adv_grad_norm = adv_grad_norm.detach()
-                    if (
-                        args.fd_adv_finite_guard
-                        and (
-                            adv_grad_norm is None
-                            or not all_ranks_finite(adv_grad_norm)
+                    grad_ready = True
+                    if args.fd_adv_finite_guard:
+                        has_any_param_grad = any(
+                            parameter.grad is not None
+                            for group in adv_optimizer.param_groups
+                            for parameter in group["params"]
                         )
-                    ):
+                        if adv_grad_norm is None:
+                            optimized_parameter = next(
+                                parameter
+                                for group in adv_optimizer.param_groups
+                                for parameter in group["params"]
+                            )
+                            grad_ready_local = torch.zeros(
+                                (),
+                                dtype=torch.bool,
+                                device=optimized_parameter.device,
+                            )
+                        else:
+                            grad_ready_local = torch.isfinite(
+                                adv_grad_norm.detach()
+                            ).all()
+                            if not has_any_param_grad:
+                                grad_ready_local = torch.zeros_like(
+                                    grad_ready_local
+                                )
+                        grad_ready = all_ranks_true(grad_ready_local)
+                    if args.fd_adv_finite_guard and not grad_ready:
                         adv_nonfinite_skips += 1
                         judge["_adv_nonfinite_skips_session"] = (
                             int(judge.get("_adv_nonfinite_skips_session", 0)) + 1
@@ -1917,11 +1966,11 @@ def get_fd_train_step(
                         last_adv_raw_fd = adv_raw_fd.detach()
                 adv_optimizer.zero_grad(set_to_none=True)
                 if last_adv_fd is not None:
-                    loss_dict[f"fd_adv_critic_{judge['name']}"] = float(last_adv_fd)
+                    loss_dict[f"fd_adv_critic_{judge['name']}"] = last_adv_fd
                 if last_adv_raw_fd is not None:
-                    loss_dict[f"fd_adv_critic_raw_{judge['name']}"] = float(last_adv_raw_fd)
+                    loss_dict[f"fd_adv_critic_raw_{judge['name']}"] = last_adv_raw_fd
                 if last_adv_grad_norm is not None:
-                    loss_dict[f"fd_adv_critic_grad_norm_{judge['name']}"] = float(last_adv_grad_norm)
+                    loss_dict[f"fd_adv_critic_grad_norm_{judge['name']}"] = last_adv_grad_norm
                 loss_dict[f"fd_adv_critic_steps_applied_{judge['name']}"] = float(
                     adv_steps_applied
                 )
@@ -1938,21 +1987,21 @@ def get_fd_train_step(
                     for metric_name, metric_value in last_adv_residual_metrics.items():
                         loss_dict[
                             f"fd_adv_residual_critic_{metric_name}_{judge['name']}"
-                        ] = float(metric_value)
+                        ] = metric_value.detach()
                 if last_adv_norm_offset_metrics is not None:
                     for metric_name, metric_value in (
                         last_adv_norm_offset_metrics.items()
                     ):
                         loss_dict[
                             f"fd_adv_norm_offset_critic_{metric_name}_{judge['name']}"
-                        ] = float(metric_value)
+                        ] = metric_value.detach()
                 if args.fd_adv_neg_real_degrade_ratio > 0 and last_adv_fd is not None:
                     denom = max(1, neg_real_count + neg_fake_count)
                     loss_dict[f"fd_adv_critic_neg_real_ratio_{judge['name']}"] = float(neg_real_count / denom)
                 if last_patch_d_loss is not None:
-                    loss_dict[f"fd_adv_patch_d_loss_{judge['name']}"] = float(last_patch_d_loss)
-                    loss_dict[f"fd_adv_patch_d_real_{judge['name']}"] = float(last_patch_d_real)
-                    loss_dict[f"fd_adv_patch_d_fake_{judge['name']}"] = float(last_patch_d_fake)
+                    loss_dict[f"fd_adv_patch_d_loss_{judge['name']}"] = last_patch_d_loss
+                    loss_dict[f"fd_adv_patch_d_real_{judge['name']}"] = last_patch_d_real
+                    loss_dict[f"fd_adv_patch_d_fake_{judge['name']}"] = last_patch_d_fake
 
         log_amfd_fd = (
             amfd_active
@@ -1970,17 +2019,17 @@ def get_fd_train_step(
                     if log_amfd_fd:
                         with torch.no_grad():
                             fid, _ = _compute_fd_main_loss(judge, new_feats.detach())
-                        loss_dict[f"fid_{judge['name']}"] = float(fid)
+                        loss_dict[f"fid_{judge['name']}"] = fid.detach()
                         del fid
                     fd_loss, amfd_logs = amfd_generator_loss(
                         judge, feats, y, args,
                     )
                     for k, v in amfd_logs.items():
-                        loss_dict[f"{judge['name']}/{k}"] = float(v)
+                        loss_dict[f"{judge['name']}/{k}"] = v.detach()
                     del amfd_logs
                 else:
                     fid, fd_loss = _compute_fd_main_loss(judge, new_feats)
-                    loss_dict[f"fid_{judge['name']}"] = float(fid.detach())
+                    loss_dict[f"fid_{judge['name']}"] = fid.detach()
                     del fid
                 loss = loss + fd_loss.detach()
                 fd_loss.backward(
@@ -1995,17 +2044,17 @@ def get_fd_train_step(
                     if log_amfd_fd:
                         with torch.no_grad():
                             fid, _ = _compute_fd_main_loss(judge, new_feats.detach())
-                        loss_dict[f"fid_{judge['name']}"] = float(fid)
+                        loss_dict[f"fid_{judge['name']}"] = fid.detach()
                         del fid
                     fd_loss, amfd_logs = amfd_generator_loss(
                         judge, all_local_feats[i], y, args,
                     )
                     for k, v in amfd_logs.items():
-                        loss_dict[f"{judge['name']}/{k}"] = float(v)
+                        loss_dict[f"{judge['name']}/{k}"] = v.detach()
                     del amfd_logs
                 else:
                     fid, fd_loss = _compute_fd_main_loss(judge, new_feats)
-                    loss_dict[f"fid_{judge['name']}"] = float(fid.detach())
+                    loss_dict[f"fid_{judge['name']}"] = fid.detach()
                     del fid
                 loss = loss + fd_loss
 
@@ -2093,13 +2142,11 @@ def get_fd_train_step(
                     for metric_name, metric_value in residual_metrics.items():
                         loss_dict[
                             f"fd_adv_residual_{metric_name}_{judge['name']}"
-                        ] = float(metric_value)
+                        ] = metric_value.detach()
                 if log_feature_cap_fraction and fake_pre_cap_norms is not None:
                     loss_dict[
                         f"fd_adv_feature_cap_fraction_fake_{judge['name']}"
-                    ] = float(
-                        (fake_pre_cap_norms > feature_norm_cap).float().mean()
-                    )
+                    ] = (fake_pre_cap_norms > feature_norm_cap).float().mean()
                 if log_feature_scale:
                     feature_scale_by_split = {
                         "fake": _adv_feature_scale_stats(
@@ -2135,7 +2182,7 @@ def get_fd_train_step(
                         fake_rms = feature_scale_by_split["fake"]["rms"]
                         loss_dict[
                             f"fd_adv_feature_scale_fake_to_real_rms_{judge['name']}"
-                        ] = fake_rms / max(real_rms, 1e-12)
+                        ] = fake_rms / real_rms.clamp_min(1e-12)
                 fake_mu, fake_cov = judge["adv_fake_stats"].build_stats(fake_adv)
                 adv_fd = _compute_fd_adv_from_stats(
                     real_mu,
@@ -2164,18 +2211,14 @@ def get_fd_train_step(
                     adv_raw_fd = None
                 adv_fd_loss = adv_fd / (adv_fd.detach() + fid_norm_eps)
                 if args.fd_adv_finite_guard:
+                    # Stats/features were already checked locally before the
+                    # FD eigensolve; any bad input is represented by a
+                    # connected NaN adv_fd and synchronized here.  Re-scanning
+                    # the large covariance/features would be redundant.
                     generator_adv_finite = torch.stack(
                         [
                             torch.isfinite(value).all()
-                            for value in (
-                                adv_fd,
-                                adv_fd_loss,
-                                fake_adv,
-                                fake_mu,
-                                fake_cov,
-                                real_mu,
-                                real_cov,
-                            )
+                            for value in (adv_fd, adv_fd_loss)
                         ]
                     ).all()
                     if not adv_fd.requires_grad:
@@ -2199,9 +2242,9 @@ def get_fd_train_step(
                     judge["_adv_real_update"] = real_update
                 judge["_adv_fake_update"] = fake_adv.detach()
                 loss = loss + fd_adv_effective_weight * judge["weight"] * adv_fd_loss
-                loss_dict[f"fd_adv_{judge['name']}"] = float(adv_fd.detach())
+                loss_dict[f"fd_adv_{judge['name']}"] = adv_fd.detach()
                 if adv_raw_fd is not None:
-                    loss_dict[f"fd_adv_raw_{judge['name']}"] = float(adv_raw_fd.detach())
+                    loss_dict[f"fd_adv_raw_{judge['name']}"] = adv_raw_fd.detach()
 
         fd_main_loss = loss
 
@@ -2213,7 +2256,7 @@ def get_fd_train_step(
             dmd_effective_loss = args.dmd_guidance_weight * dmd_loss
             loss = loss + dmd_effective_loss
             loss_dict.update(dmd_dict)
-            loss_dict["dmd_effective_loss"] = float(dmd_effective_loss.detach())
+            loss_dict["dmd_effective_loss"] = dmd_effective_loss.detach()
 
         if gan_active:
             _set_requires_grad(patch_discriminator, False)
@@ -2243,14 +2286,14 @@ def get_fd_train_step(
             )
             patch_g_effective_loss = patch_g_effective_weight * patch_g_loss
             loss = loss + patch_g_effective_loss
-            loss_dict["patch_g_loss"] = float(patch_g_loss.detach())
-            loss_dict["patch_g_adaptive_weight"] = float(patch_g_adaptive_weight.detach())
+            loss_dict["patch_g_loss"] = patch_g_loss.detach()
+            loss_dict["patch_g_adaptive_weight"] = patch_g_adaptive_weight.detach()
             loss_dict["patch_g_warmup"] = float(patch_g_warmup)
-            loss_dict["patch_g_effective_weight"] = float(patch_g_effective_weight.detach())
-            loss_dict["patch_g_effective_loss"] = float(patch_g_effective_loss.detach())
-            loss_dict["patch_d_loss"] = float(d_loss.detach())
-            loss_dict["patch_d_real"] = float(d_real.detach().mean())
-            loss_dict["patch_d_fake"] = float(d_fake.detach().mean())
+            loss_dict["patch_g_effective_weight"] = patch_g_effective_weight.detach()
+            loss_dict["patch_g_effective_loss"] = patch_g_effective_loss.detach()
+            loss_dict["patch_d_loss"] = d_loss.detach()
+            loss_dict["patch_d_real"] = d_real.detach().mean()
+            loss_dict["patch_d_fake"] = d_fake.detach().mean()
             _set_requires_grad(patch_discriminator, True)
 
         if jit_loss_weight > 0:
@@ -2259,7 +2302,7 @@ def get_fd_train_step(
             velocity_target = t_view * (noise - x0) / t_view.clamp_min(model_wo_ddp.t_eps)
             jit_loss = ((velocity_pred - velocity_target) ** 2).mean()
             loss = loss + jit_loss_weight * jit_loss
-            loss_dict["jit_loss"] = float(jit_loss.detach())
+            loss_dict["jit_loss"] = jit_loss.detach()
 
         if not args.fd_sequential_backward:
             loss.backward(create_graph=False)
@@ -3109,6 +3152,92 @@ def train_and_evaluate(args):
     ]:
         metric_logger.add_meter(name, SmoothedValue(window, fmt))
 
+    # Keep detached scalar diagnostics on device between print steps.  At a
+    # flush we reduce every pending step in one packed collective, then make a
+    # single device-to-host copy.  Replaying the reduced records in order keeps
+    # MetricLogger's windows/medians identical to per-step updates.
+    pending_metric_records = []
+
+    def _metric_schema_codes(keys):
+        payload = b"\0".join(key.encode("utf-8") for key in keys)
+        digest = hashlib.blake2s(payload, digest_size=8).digest()
+        # These byte-sized codes and their squares are exactly representable
+        # in FP32 at the world sizes used here.  They share the metric
+        # collective, detecting silent cross-rank key/record misalignment
+        # without introducing another rendezvous.
+        return (len(keys), *digest)
+
+    def _queue_distributed_metrics(
+        step_loss,
+        step_loss_dict,
+        step_local_metrics,
+    ):
+        if "loss" in step_loss_dict:
+            raise KeyError("loss_dict must not contain the reserved 'loss' metric")
+        keys = tuple(sorted(step_loss_dict))
+        values = tuple(
+            value.detach() if isinstance(value, torch.Tensor) else value
+            for value in (step_loss_dict[key] for key in keys)
+        )
+        local_metrics = {
+            key: value.detach() if isinstance(value, torch.Tensor) else value
+            for key, value in step_local_metrics.items()
+        }
+        pending_metric_records.append((
+            step_loss.detach(),
+            keys,
+            values,
+            _metric_schema_codes(keys),
+            local_metrics,
+        ))
+
+    def _flush_distributed_metrics():
+        if not pending_metric_records:
+            return None
+        flat_values = []
+        for step_loss, _, values, schema_codes, _ in pending_metric_records:
+            for code in schema_codes:
+                flat_values.extend((float(code), float(code * code)))
+            flat_values.append(step_loss)
+            flat_values.extend(values)
+        reduced_values = all_reduce_mean_many(
+            flat_values,
+            device=pending_metric_records[0][0].device,
+        )
+
+        reduced_records = []
+        offset = 0
+        for _, keys, values, schema_codes, local_metrics in pending_metric_records:
+            for code in schema_codes:
+                code_mean = reduced_values[offset]
+                code_square_mean = reduced_values[offset + 1]
+                offset += 2
+                variance = max(0.0, code_square_mean - code_mean * code_mean)
+                if (
+                    not math.isclose(code_mean, float(code), abs_tol=1e-3)
+                    or variance > 1e-2
+                ):
+                    raise RuntimeError(
+                        "distributed metric schema differs across ranks"
+                    )
+            loss_value = reduced_values[offset]
+            offset += 1
+            count = len(values)
+            reduced_loss_dict = dict(
+                zip(keys, reduced_values[offset:offset + count])
+            )
+            offset += count
+            metric_logger.update(
+                loss=loss_value,
+                **local_metrics,
+                **reduced_loss_dict,
+            )
+            reduced_records.append((loss_value, reduced_loss_dict))
+        if offset != len(reduced_values):
+            raise RuntimeError("packed metric reduction layout mismatch")
+        pending_metric_records.clear()
+        return reduced_records[-1]
+
     def _infinite():
         while True:
             yield None
@@ -3179,21 +3308,33 @@ def train_and_evaluate(args):
         step_time = time.perf_counter() - step_start
         step_start = time.perf_counter()
 
-        loss_value = all_reduce_mean(loss.item())
-        loss_dict = {k: all_reduce_mean(v) for k, v in loss_dict.items()}
         sps = args.batch_size / step_time if step_time > 0 else 0.0
         mem_gb = torch.cuda.max_memory_reserved() / (1024 ** 3) if torch.cuda.is_available() else 0.0
 
-        metric_logger.update(
-            loss=loss_value, grad_norm=grad_norm,
-            lr=optimizer.param_groups[0]["lr"],
-            **{"samples/s/device": sps, "samples/s": sps * args.world_size,
-               "samples_seen(M)": args.samples_seen / 1e6, "device_mem(GB)": mem_gb},
-            **loss_dict,
+        _queue_distributed_metrics(
+            loss,
+            loss_dict,
+            {
+                "grad_norm": grad_norm,
+                "lr": optimizer.param_groups[0]["lr"],
+                "samples/s/device": sps,
+                "samples/s": sps * args.world_size,
+                "samples_seen(M)": args.samples_seen / 1e6,
+                "device_mem(GB)": mem_gb,
+            },
         )
-
+        flush_metrics = (
+            step % args.print_freq == 0
+            or args.current_step == args.total_steps
+        )
+        reduced_current_metrics = (
+            _flush_distributed_metrics() if flush_metrics else None
+        )
         # wandb
         if step % args.print_freq == 0 and wandb_logger:
+            if reduced_current_metrics is None:
+                raise RuntimeError("W&B logging requires a flushed metric record")
+            loss_value, reduced_loss_dict = reduced_current_metrics
             elapsed = time.time() - session_start + args.last_elapsed_time
             remaining = args.total_steps - args.current_step
             eta = elapsed / args.current_step * remaining if args.current_step > 0 else 0.0
@@ -3211,7 +3352,7 @@ def train_and_evaluate(args):
                 "perf/elapsed_device_hours": elapsed_h * args.world_size,
                 "perf/eta_real_hours": eta / 3600,
                 "perf/eta_device_hours": eta / 3600 * args.world_size,
-                **{f"train/{k}": v for k, v in loss_dict.items()},
+                **{f"train/{k}": v for k, v in reduced_loss_dict.items()},
             }, step=args.current_step)
 
         # dynamic checkpoint frequency
