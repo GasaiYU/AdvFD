@@ -91,6 +91,32 @@ class PatchDiscriminator(nn.Module):
         return self.net[-1](features)
 
 
+class InceptionDiscriminator(nn.Module):
+    """Trainable pretrained Inception features with one scalar GAN head."""
+
+    def __init__(self, device="cuda"):
+        super().__init__()
+        from utils.perception_util import load_inception
+
+        self.backbone = load_inception(
+            device=device, normalize=False, feature_layer="pool3", pretrained=True,
+        )
+        # Only the feature trunk is used; replace the unused pretrained classifier.
+        self.backbone.fc = nn.Identity()
+        self.backbone.requires_grad_(True)
+        self.head = nn.Linear(2048, 1).to(device)
+        nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.head.bias)
+        self.train()
+
+    def forward(self, images):
+        # GAP(Mixed_7c) is pool3; stop before the unused classifier.
+        features, _ = self.backbone.forward_features_by_layer(
+            images, ["Mixed_7c"],
+        )["Mixed_7c"]
+        return self.head(features).squeeze(-1)
+
+
 def patch_discriminator_loss(discriminator, real_images, fake_images):
     real_logits = discriminator(real_images)
     fake_logits = discriminator(fake_images.detach())

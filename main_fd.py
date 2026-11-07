@@ -55,6 +55,7 @@ from utils.schedule_util import adjust_learning_rate
 from utils.setup_util import setup
 from utils.vis_util import visualize
 from models.patch_gan import (
+    InceptionDiscriminator,
     PatchDiscriminator,
     patch_discriminator_loss,
     patch_generator_loss,
@@ -2024,7 +2025,6 @@ def get_fd_train_step(
             loss_dict["patch_d_loss"] = float(d_loss.detach())
             loss_dict["patch_d_real"] = float(d_real.detach().mean())
             loss_dict["patch_d_fake"] = float(d_fake.detach().mean())
-            _set_requires_grad(patch_discriminator, True)
 
         if jit_loss_weight > 0:
             if not args.fd_random_timestep_training or velocity_pred is None:
@@ -2036,6 +2036,10 @@ def get_fd_train_step(
 
         if not args.fd_sequential_backward:
             loss.backward(create_graph=False)
+
+        if gan_active:
+            # Checkpoint recomputation must see the same frozen D as G forward.
+            _set_requires_grad(patch_discriminator, True)
 
         if torch.distributed.is_initialized() and ddp_model is None:
             # With DDP the reducer already averaged these during backward.
@@ -2187,11 +2191,14 @@ def train_and_evaluate(args):
     patch_discriminator = None
     patch_d_optimizer = None
     if args.patch_gan_weight > 0:
-        patch_discriminator = PatchDiscriminator(
-            in_channels=3,
-            base_channels=args.patch_gan_channels,
-            num_layers=args.patch_gan_layers,
-        ).cuda()
+        if args.patch_gan_backbone == "inception":
+            patch_discriminator = InceptionDiscriminator().cuda()
+        else:
+            patch_discriminator = PatchDiscriminator(
+                in_channels=3,
+                base_channels=args.patch_gan_channels,
+                num_layers=args.patch_gan_layers,
+            ).cuda()
         broadcast_module_params(patch_discriminator, src=0)
         patch_d_optimizer = torch.optim.AdamW(
             patch_discriminator.parameters(),
@@ -2200,7 +2207,7 @@ def train_and_evaluate(args):
             weight_decay=args.patch_gan_weight_decay,
         )
         logger.info(
-            f"[PatchGAN] enabled: weight={args.patch_gan_weight}, "
+            f"[GAN] backbone={args.patch_gan_backbone}, weight={args.patch_gan_weight}, "
             f"lr={args.patch_gan_lr}, channels={args.patch_gan_channels}, "
             f"layers={args.patch_gan_layers}, start_step={args.patch_gan_start_step}, "
             f"grad_checkpointing={args.patch_gan_grad_checkpointing}"
@@ -2242,6 +2249,8 @@ def train_and_evaluate(args):
 
     if patch_discriminator is not None and extra is not None and "patch_gan_state" in extra:
         gan_state = extra["patch_gan_state"]
+        if gan_state.get("backbone", "patchgan") != args.patch_gan_backbone:
+            raise ValueError("Cannot resume GAN state with a different discriminator backbone")
         patch_discriminator.load_state_dict(gan_state["discriminator"])
         if "optimizer" in gan_state:
             patch_d_optimizer.load_state_dict(gan_state["optimizer"])
@@ -2958,6 +2967,7 @@ def train_and_evaluate(args):
                 fd_extra["fd_adv_states"] = save_fd_adv_states(adv_judges)
             if patch_discriminator is not None:
                 fd_extra["patch_gan_state"] = {
+                    "backbone": args.patch_gan_backbone,
                     "discriminator": patch_discriminator.state_dict(),
                     "optimizer": patch_d_optimizer.state_dict(),
                 }
@@ -3344,8 +3354,10 @@ def get_args_parser():
                         help="temporary lr for PatchGAN adversarial FD pretrain; <=0 reuses --fd_adv_lr")
     parser.add_argument("--fd_adv_patch_pretrain_log_freq", type=int, default=100,
                         help="log PatchGAN adversarial FD pretrain every N steps; 0 disables progress logs")
+    parser.add_argument("--patch_gan_backbone", choices=("patchgan", "inception"), default="patchgan",
+                        help="GAN discriminator: original PatchGAN or trainable pretrained Inception + scalar head")
     parser.add_argument("--patch_gan_weight", type=float, default=0.0,
-                        help="weight for PatchGAN generator hinge loss; 0 disables it")
+                        help="weight for GAN generator hinge loss; 0 disables it")
     parser.add_argument("--patch_gan_lr", type=float, default=2e-4,
                         help="PatchGAN discriminator learning rate")
     parser.add_argument("--patch_gan_channels", type=int, default=64,
