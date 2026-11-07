@@ -8,10 +8,10 @@
 # Existing reference statistics are required on BOTH nodes; no stats jobs run.
 # W&B is online, with one run created by global rank 0 only.
 #
-# Replace 10.0.0.1 with node 0's address reachable from BOTH machines:
-# Node 0: NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash scripts/rebuttal/w3_jit_b_sim_resnet50_swin_t_2nodes.sh
-# Node 1: NODE_RANK=1 MASTER_ADDR=10.0.0.1 bash scripts/rebuttal/w3_jit_b_sim_resnet50_swin_t_2nodes.sh
-# Preview: DRY_RUN=1 NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash scripts/rebuttal/w3_jit_b_sim_resnet50_swin_t_2nodes.sh
+# Default master (node 0): 10.82.122.84; override MASTER_ADDR if needed.
+# Node 0: NODE_RANK=0 bash scripts/rebuttal/w3_jit_b_sim_resnet50_swin_t_2nodes.sh
+# Node 1: NODE_RANK=1 bash scripts/rebuttal/w3_jit_b_sim_resnet50_swin_t_2nodes.sh
+# Preview: DRY_RUN=1 NODE_RANK=0 bash scripts/rebuttal/w3_jit_b_sim_resnet50_swin_t_2nodes.sh
 # Run `wandb login` on node 0 first if that account is not already logged in.
 # Both nodes need the same code/config, base checkpoint, pretrained weights,
 # reference statistics, and access to the same shared OUTPUT_DIR for resume.
@@ -24,7 +24,7 @@ case "${NODE_RANK:-}" in
     0|1) ;;
     *) echo "[ERR] Set NODE_RANK=0 on the first machine, NODE_RANK=1 on the second" >&2; exit 1 ;;
 esac
-: "${MASTER_ADDR:?Set MASTER_ADDR to the address of node 0 reachable from both machines}"
+: "${MASTER_ADDR:=10.82.122.84}"
 case "$MASTER_ADDR" in
     localhost|127.*|::1|0.0.0.0)
         echo "[ERR] MASTER_ADDR must be reachable from the second machine, not a loopback/bind address" >&2; exit 1 ;;
