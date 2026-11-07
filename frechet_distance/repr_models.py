@@ -122,12 +122,16 @@ class TimmReprModel(torch.nn.Module):
         from timm.data import resolve_data_config
 
         logger.info(f"[TimmReprModel] Loading model: {model_name}")
-        # dynamic_img_size/pad only supported by ViT-like models
         kwargs = dict(pretrained=True, num_classes=0)
-        try:
-            self.model = timm.create_model(model_name, dynamic_img_size=True, dynamic_img_pad=True, **kwargs)
-        except TypeError:
+        # ResNet/Swin use their native constructors. Dynamic image arguments
+        # are for ViT-like backbones and ResNet rejects them outright.
+        if model_name.lower().startswith(("resnet", "swin")):
             self.model = timm.create_model(model_name, **kwargs)
+        else:
+            try:
+                self.model = timm.create_model(model_name, dynamic_img_size=True, dynamic_img_pad=True, **kwargs)
+            except TypeError:
+                self.model = timm.create_model(model_name, **kwargs)
         self.model.to(device).eval().requires_grad_(False)
         self.num_prefix_tokens = getattr(self.model, "num_prefix_tokens", 0)
         self.has_attn_pool = hasattr(self.model, "attn_pool") and self.model.attn_pool is not None
