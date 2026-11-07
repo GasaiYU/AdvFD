@@ -31,9 +31,11 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-# export HF_HOME="${HF_HOME:-/mmu-vcg/gaomingju/data/models/}"
+export HF_HOME="${HF_HOME:-/mmu-vcg/gaomingju/data/models/}"
 export TORCH_HOME="${TORCH_HOME:-/mmu-vcg/gaomingju/data/models/}"
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+# Prefer downloaded weights in $TORCH_HOME/hub/checkpoints before Hugging Face.
+export TIMM_USE_OLD_CACHE="${TIMM_USE_OLD_CACHE:-1}"
+# export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" 
 : "${MODE:=overhead}"
 : "${DATA_ROOT:=/mmu-vcg/zhangxu34/datasets/ImageNet-1K/}"
 : "${CKPT_ROOT:=./checkpoints/base}"
