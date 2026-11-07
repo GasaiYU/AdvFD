@@ -99,7 +99,7 @@ def profile():
     args.save_freq = 10**9
     args.milestone_interval = 0
     args.enable_wandb = False
-    args.print_freq = 10**9
+    args.print_freq = 20
     initial_step = args.current_step
     meter = IterationMeter(args.profile_warmup_steps, args.profile_steps)
     original_factory = trainer.get_fd_train_step
@@ -138,6 +138,10 @@ def profile():
 
     def instrumented_factory(*factory_args, **factory_kwargs):
         step_fn = original_factory(*factory_args, **factory_kwargs)
+        if args.rank == 0:
+            print(f"[Profile] {meter.warmup} warmup + {meter.steps} measured iterations; "
+                  f"stop at virtual step {initial_step + meter.warmup + meter.steps}. "
+                  f"Progress every {args.print_freq} steps.", flush=True)
         last_start = None
 
         def measured_step():
