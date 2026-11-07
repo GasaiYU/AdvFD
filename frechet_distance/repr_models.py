@@ -132,6 +132,8 @@ class TimmReprModel(torch.nn.Module):
         self.num_prefix_tokens = getattr(self.model, "num_prefix_tokens", 0)
         self.has_attn_pool = hasattr(self.model, "attn_pool") and self.model.attn_pool is not None
         self.feat_dim = self.model.num_features
+        output_fmt = getattr(self.model, "output_fmt", "NCHW")
+        self.channels_last = getattr(output_fmt, "value", output_fmt) == "NHWC"
         self.grad_checkpointing = grad_checkpointing
 
         data_cfg = resolve_data_config(self.model.pretrained_cfg)
@@ -165,9 +167,10 @@ class TimmReprModel(torch.nn.Module):
             feats = checkpoint(lambda inp: self.model.forward_features(inp), x, use_reentrant=False)
         else:
             feats = self.model.forward_features(x)
-        # CNN models return (B, C, H, W); pool spatially
+        # CNNs return NCHW; timm Swin returns NHWC. Pool only spatial axes.
         if feats.ndim == 4:
-            cls_token = feats.mean(dim=[2, 3])
+            spatial_dims = (1, 2) if self.channels_last else (2, 3)
+            cls_token = feats.mean(dim=spatial_dims)
             return cls_token, None
         # ViT models return (B, N, C)
         patch_tokens = feats[:, self.num_prefix_tokens :]
@@ -186,6 +189,8 @@ class TimmReprModel(torch.nn.Module):
         x = _preprocess(x, self.mean, self.std, self.target_size)
         feats = self.model.forward_features(x)
         if feats.ndim == 4:
+            if self.channels_last:
+                return feats.reshape(feats.shape[0], -1, feats.shape[-1]).float()
             return feats.flatten(2).transpose(1, 2).float()
         return feats.float()
 
