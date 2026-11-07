@@ -31,7 +31,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-export HF_HOME="${HF_HOME:-/mmu-vcg/gaomingju/data/models/}"
+# export HF_HOME="${HF_HOME:-/mmu-vcg/gaomingju/data/models/}"
 export TORCH_HOME="${TORCH_HOME:-/mmu-vcg/gaomingju/data/models/}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 : "${MODE:=overhead}"
