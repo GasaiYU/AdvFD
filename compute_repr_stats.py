@@ -43,6 +43,9 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=256,
                    help="batch size per GPU (default: 256)")
     p.add_argument("--num_workers", type=int, default=10)
+    p.add_argument("--decode_threads", type=int, default=0,
+                   help="if > 0, decode images with this many threads per GPU instead of "
+                        "DataLoader worker processes (no /dev/shm needed; --num_workers is ignored)")
     p.add_argument("--target_size", type=int, default=None,
                    help="override model's native target resolution for preprocessing")
     p.add_argument("--output_dir", type=str, default="data/fid_stats",
@@ -61,7 +64,48 @@ def setup_distributed():
     return rank, world_size
 
 
-def build_dataloader(data_path, img_size, batch_size, num_workers, rank, world_size):
+class ThreadedLoader:
+    """Batches decoded by a thread pool in the calling process.
+
+    Same samples, order and transform as the DataLoader path, but without
+    worker processes, so nothing goes through /dev/shm. PIL decoding/resizing
+    release the GIL, so the threads run in parallel.
+    """
+
+    def __init__(self, dataset, indices, batch_size, threads, prefetch=2):
+        self.dataset = dataset
+        self.batches = [indices[i:i + batch_size] for i in range(0, len(indices), batch_size)]
+        self.threads = threads
+        self.prefetch = prefetch
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __iter__(self):
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=self.threads) as pool:
+            pending = deque()
+            upcoming = iter(self.batches)
+
+            def submit_next():
+                batch = next(upcoming, None)
+                if batch is not None:
+                    pending.append([pool.submit(self.dataset.__getitem__, i) for i in batch])
+
+            for _ in range(self.prefetch):
+                submit_next()
+            while pending:
+                futures = pending.popleft()
+                submit_next()
+                items = [future.result() for future in futures]
+                yield (torch.stack([image for image, _ in items]),
+                       torch.tensor([label for _, label in items]))
+
+
+def build_dataloader(data_path, img_size, batch_size, num_workers, rank, world_size,
+                     decode_threads=0):
     """Build dataloader for an ImageFolder dataset."""
     transform = transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, img_size)),
@@ -71,6 +115,9 @@ def build_dataloader(data_path, img_size, batch_size, num_workers, rank, world_s
     dataset = datasets.ImageFolder(os.path.join(data_path, "train"), transform=transform)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
                                  shuffle=False, drop_last=False) if world_size > 1 else None
+    if decode_threads > 0:
+        indices = list(sampler) if sampler is not None else list(range(len(dataset)))
+        return ThreadedLoader(dataset, indices, batch_size, decode_threads), len(dataset)
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
                         num_workers=num_workers, pin_memory=True,
                         shuffle=False, drop_last=False)
@@ -163,6 +210,7 @@ def main():
     loader, total_images = build_dataloader(
         args.data_path, args.img_size, args.batch_size,
         args.num_workers, rank, world_size,
+        decode_threads=args.decode_threads,
     )
 
     if args.num_images is not None:

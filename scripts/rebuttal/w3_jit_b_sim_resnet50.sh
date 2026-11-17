@@ -57,6 +57,12 @@ export TIMM_USE_OLD_CACHE="${TIMM_USE_OLD_CACHE:-1}"
 : "${PROFILE_WARMUP_STEPS:=50}"
 : "${PROFILE_STEPS:=200}"
 : "${ENABLE_WANDB:=1}"
+# Reference-stat pass: decode with STATS_DECODE_THREADS threads per GPU, which needs
+# no /dev/shm. STATS_DECODE_THREADS=0 falls back to STATS_NUM_WORKERS DataLoader
+# worker processes (fails with "bus error" when /dev/shm is small). Same results.
+: "${STATS_DECODE_THREADS:=8}"
+: "${STATS_NUM_WORKERS:=10}"
+: "${STATS_BATCH_SIZE:=128}"
 : "${DRY_RUN:=0}"
 
 case "$MODE" in overhead|train|stats) ;; *) echo "[ERR] MODE must be overhead, train, or stats" >&2; exit 1 ;; esac
@@ -98,7 +104,9 @@ ensure_stats() {
     local model="$1" stats="$2"
     if [[ ! -f "$stats" ]]; then
         run_command "${LAUNCH[@]}" compute_repr_stats.py --model "$model" \
-            --data_path "$DATA_ROOT" --img_size 256 --target_size 224 --batch_size 128
+            --data_path "$DATA_ROOT" --img_size 256 --target_size 224 \
+            --batch_size "$STATS_BATCH_SIZE" --num_workers "$STATS_NUM_WORKERS" \
+            --decode_threads "$STATS_DECODE_THREADS"
     fi
 }
 case "$MODE" in
