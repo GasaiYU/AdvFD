@@ -9,7 +9,7 @@
 #   GPUS_PER_NODE=8 MODE=stats bash scripts/rebuttal/w3_jit_b_sim_resnet50.sh
 # W&B is online, with one run created by global rank 0 only.
 #
-# Default master (node 0): 10.82.122.84; override MASTER_ADDR if needed.
+# Default master (node 0): 10.82.122.142; override MASTER_ADDR if needed.
 # Node 0: NODE_RANK=0 bash scripts/rebuttal/w3_jit_b_sim_resnet101_2nodes.sh
 # Node 1: NODE_RANK=1 bash scripts/rebuttal/w3_jit_b_sim_resnet101_2nodes.sh
 # Preview: DRY_RUN=1 NODE_RANK=0 bash scripts/rebuttal/w3_jit_b_sim_resnet101_2nodes.sh
@@ -25,7 +25,7 @@ case "${NODE_RANK:-}" in
     0|1) ;;
     *) echo "[ERR] Set NODE_RANK=0 on the first machine, NODE_RANK=1 on the second" >&2; exit 1 ;;
 esac
-: "${MASTER_ADDR:=10.82.122.84}"
+: "${MASTER_ADDR:=10.82.122.142}"
 case "$MASTER_ADDR" in
     localhost|127.*|::1|0.0.0.0)
         echo "[ERR] MASTER_ADDR must be reachable from the second machine, not a loopback/bind address" >&2; exit 1 ;;
