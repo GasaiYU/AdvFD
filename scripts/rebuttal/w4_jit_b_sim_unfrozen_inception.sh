@@ -32,6 +32,12 @@
 # Compare with SIM-FD-only and SIM-FD+AdvFD at the SAME checkpoint step, EMA
 # label, sampling seed and FD-r3 evaluation protocol.
 # Optional: UNFREEZE_LR=... UNFREEZE_GRAD_CLIP=... to change the Inception optimizer.
+#
+# Two machines, 16 GPUs (batch 64/GPU). With NNODES=2 the default master (node 0)
+# is 10.82.122.142. With NNODES=1 it is 127.0.0.1. Override with MASTER_ADDR.
+#   Node 0: NNODES=2 NODE_RANK=0 bash scripts/rebuttal/w4_jit_b_sim_unfrozen_inception.sh
+#   Node 1: NNODES=2 NODE_RANK=1 bash scripts/rebuttal/w4_jit_b_sim_unfrozen_inception.sh
+# Both nodes need the same code, checkpoint and a shared OUTPUT_DIR for resume.
 
 set -euo pipefail
 
@@ -46,7 +52,7 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 : "${OUTPUT_DIR:=./work_dirs}"
 : "${NNODES:=1}"
 : "${NODE_RANK:=0}"
-: "${MASTER_ADDR:=127.0.0.1}"
+if [[ "$NNODES" == "1" ]]; then : "${MASTER_ADDR:=127.0.0.1}"; else : "${MASTER_ADDR:=10.82.122.142}"; fi
 : "${MASTER_PORT:=29500}"
 : "${GPUS_PER_NODE:=8}"
 : "${GLOBAL_BSZ:=1024}"
