@@ -144,6 +144,44 @@ def load_fd_queue_states(judges, saved_states):
     return loaded == len(judges)
 
 
+def save_fd_repr_states(judges):
+    """Collect weights and optimizer state of trainable (unfrozen) repr judges."""
+    return [
+        {
+            "name": j["name"],
+            "model": j["model"].state_dict(),
+            "optimizer": j["repr_optimizer"].state_dict(),
+        }
+        for j in judges
+        if j.get("repr_optimizer") is not None
+    ]
+
+
+def load_fd_repr_states(judges, saved_states):
+    """Restore trainable repr judges from a checkpoint; returns True if all loaded.
+
+    Without this, a resumed run would restart from the pretrained weights while
+    the restored feature queues were built with the drifted ones.
+    """
+    name_to_state = {s["name"]: s for s in (saved_states or [])}
+    total = 0
+    loaded = 0
+    for judge in judges:
+        optimizer = judge.get("repr_optimizer")
+        if optimizer is None:
+            continue
+        total += 1
+        state = name_to_state.get(judge["name"])
+        if state is None:
+            logger.warning(f"[FD-Repr] No saved trainable state for '{judge['name']}'")
+            continue
+        judge["model"].load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        loaded += 1
+        logger.info(f"[FD-Repr] Restored trainable weights and optimizer for '{judge['name']}'")
+    return loaded == total
+
+
 # ---------------------------------------------------------------------------
 # Queue filling
 # ---------------------------------------------------------------------------

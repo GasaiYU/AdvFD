@@ -38,6 +38,7 @@ from frechet_distance.judges import (
     extract_judge_features, extract_judge_features_all,
     infer_stats_path, resolve_per_model_args,
     save_fd_queue_states, load_fd_queue_states,
+    save_fd_repr_states, load_fd_repr_states,
     fill_all_queues, run_sanity_check,
 )
 from frechet_distance.adversarial import (
@@ -299,6 +300,19 @@ def _fd_repr_grad_checkpointing_enabled(args, name):
     name_l = name.lower()
     short_l = model_short_name(name).lower()
     for selector in selectors:
+        sel = selector.lower()
+        if sel in ("*", "all"):
+            return True
+        if sel == short_l or sel in name_l or sel in short_l:
+            return True
+    return False
+
+
+def _fd_repr_unfreeze_enabled(args, name):
+    """True if the main-FD repr model ``name`` is trained jointly with G."""
+    name_l = name.lower()
+    short_l = model_short_name(name).lower()
+    for selector in args.fd_repr_unfreeze_models or []:
         sel = selector.lower()
         if sel in ("*", "all"):
             return True
@@ -2045,6 +2059,33 @@ def get_fd_train_step(
             # With DDP the reducer already averaged these during backward.
             _all_reduce_grads(model_wo_ddp)
 
+        # Unfrozen main-FD repr models (e.g. Inception) are never wrapped in
+        # DDP, so average their grads explicitly, then step with their own
+        # optimizer. G steps in the training loop with the same-step grads.
+        for judge in judges:
+            repr_optimizer = judge.get("repr_optimizer")
+            if repr_optimizer is None:
+                continue
+            _all_reduce_grads(judge["model"])
+            repr_params = [
+                p for group in repr_optimizer.param_groups for p in group["params"]
+            ]
+            if args.fd_repr_unfreeze_grad_clip > 0.0:
+                repr_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    repr_params, args.fd_repr_unfreeze_grad_clip
+                )
+            else:
+                repr_grad_norm = get_grad_norm(repr_params)
+            if torch.isfinite(repr_grad_norm):
+                repr_optimizer.step()
+            else:
+                logger.warning(
+                    f"[FD-Repr] NaN/Inf grad norm for '{judge['name']}' - "
+                    "skipping its optimizer step"
+                )
+            repr_optimizer.zero_grad(set_to_none=True)
+            loss_dict[f"fd_repr_grad_norm_{judge['name']}"] = float(repr_grad_norm)
+
         for i, judge in enumerate(judges):
             judge["queue"].enqueue(all_new_feats[i].detach())
         if adv_active:
@@ -2222,6 +2263,8 @@ def train_and_evaluate(args):
         extra_keys.append("dmd_guidance_state")
     if args.fd_adv_weight > 0:
         extra_keys.append("fd_adv_states")
+    if args.fd_repr_unfreeze_models:
+        extra_keys.append("fd_repr_states")
 
     # DDP is opt-in. ``model_wo_ddp`` stays the raw module everywhere else so
     # checkpoints, EMA, sampling, and eval keep their existing state_dict keys.
@@ -2409,6 +2452,39 @@ def train_and_evaluate(args):
         sigma_ref_sqrt = None
         if args.fd_eigvalsh:
             sigma_ref_sqrt = precompute_sigma_ref_sqrt(sigma_ref)
+        repr_optimizer = None
+        if _fd_repr_unfreeze_enabled(args, name):
+            if inception_layer is None:
+                raise ValueError(
+                    "--fd_repr_unfreeze_models only supports Inception repr "
+                    f"models, got {name!r}"
+                )
+            if shared_inception_model is not None:
+                raise ValueError(
+                    "--fd_repr_unfreeze_models cannot be used when several "
+                    "Inception layers share one model"
+                )
+            # BatchNorm stays in eval mode (running stats fixed), exactly as the
+            # AdvFD critic does; only conv/BN-affine weights train.
+            _set_requires_grad(repr_model, True)
+            repr_model.eval()
+            broadcast_module_params(repr_model, src=0)
+            repr_params = [p for p in repr_model.parameters() if p.requires_grad]
+            repr_optimizer = torch.optim.AdamW(
+                repr_params,
+                lr=args.fd_repr_unfreeze_lr,
+                betas=(0.9, 0.999),
+                weight_decay=0.0,
+            )
+            logger.info(
+                "[FD] repr '%s' UNFROZEN: trained jointly with G to minimize the "
+                "same FD loss; lr=%s, grad_clip=%s, params=%d, reference stats "
+                "stay those of the pretrained model",
+                short,
+                args.fd_repr_unfreeze_lr,
+                args.fd_repr_unfreeze_grad_clip,
+                sum(p.numel() for p in repr_params),
+            )
         judge = {
             "name": short, "repr_name": name, "model": repr_model,
             "feat_dim": feat_dim,
@@ -2417,6 +2493,7 @@ def train_and_evaluate(args):
             "mu_ref": mu_ref, "sigma_ref": sigma_ref,
             "sigma_ref_sqrt": sigma_ref_sqrt,
             "queue": queue, "weight": weight,
+            "repr_optimizer": repr_optimizer,
         }
         judges.append(judge)
         eig_mode = "eigvalsh" if args.fd_eigvalsh else "eigvals"
@@ -2427,6 +2504,20 @@ def train_and_evaluate(args):
                      f"whiten={args.fd_whiten}, whiten_eps={args.fd_whiten_eps}")
 
     fd_judges_by_name = {judge["name"]: judge for judge in judges}
+    if args.fd_repr_unfreeze_models:
+        if not any(j.get("repr_optimizer") is not None for j in judges):
+            raise ValueError(
+                "--fd_repr_unfreeze_models "
+                f"{args.fd_repr_unfreeze_models} matched none of --fd_repr_models "
+                f"{args.fd_repr_models}"
+            )
+        if extra is not None and "fd_repr_states" in extra:
+            load_fd_repr_states(judges, extra["fd_repr_states"])
+        elif extra is not None:
+            logger.warning(
+                "[FD-Repr] Resuming without saved trainable repr weights: "
+                "unfrozen models restart from their pretrained weights"
+            )
     adv_judges = []
     if args.fd_adv_weight > 0:
         resolve_fd_adv_per_model_args(args)
@@ -2965,6 +3056,8 @@ def train_and_evaluate(args):
             fd_extra = {"fd_queue_states": save_fd_queue_states(judges)} if judges else {}
             if args.fd_adv_weight > 0:
                 fd_extra["fd_adv_states"] = save_fd_adv_states(adv_judges)
+            if args.fd_repr_unfreeze_models:
+                fd_extra["fd_repr_states"] = save_fd_repr_states(judges)
             if patch_discriminator is not None:
                 fd_extra["patch_gan_state"] = {
                     "backbone": args.patch_gan_backbone,
@@ -3233,6 +3326,14 @@ def get_args_parser():
                         help="per-model target resolution override (default: model's native size)")
     parser.add_argument("--fd_online_accum", action="store_true",
                         help="use online accumulators for FD (avoids cloning 50k queue each step)")
+    parser.add_argument("--fd_repr_unfreeze_models", type=str, nargs="+", default=None,
+                        help="main-FD Inception repr models to unfreeze and train jointly with G "
+                             "on the same FD loss (matched like --fd_repr_grad_checkpoint_models); "
+                             "reference stats stay those of the pretrained model")
+    parser.add_argument("--fd_repr_unfreeze_lr", type=float, default=1e-6,
+                        help="AdamW learning rate for unfrozen main-FD repr models")
+    parser.add_argument("--fd_repr_unfreeze_grad_clip", type=float, default=1.0,
+                        help="grad-norm clip for unfrozen main-FD repr models; 0 disables")
     parser.add_argument("--fd_eigvalsh", action="store_true",
                         help="use eigvalsh on symmetric product instead of eigvals (~8x faster, exact)")
     parser.add_argument("--fd_ema_beta", type=float, default=0.0, metavar="BETA",
