@@ -52,11 +52,13 @@ def load_results(directory, cases):
     return results
 
 
-def summarize(directory):
+def summarize(directory, cases=None):
+    """Compare cases against the first one (SIM); default = the ResNet-50 W3 set."""
     directory = Path(directory)
-    cases = ["sim", "sim_resnet50", "sim_advfd"]
-    if (directory / "sim_resnet50_swin_t.json").exists():
-        cases.insert(2, "sim_resnet50_swin_t")
+    if not cases:
+        cases = ["sim", "sim_resnet50", "sim_advfd"]
+        if (directory / "sim_resnet50_swin_t.json").exists():
+            cases.insert(2, "sim_resnet50_swin_t")
     results = load_results(directory, cases)
     base = results[0]
     rows = []
@@ -73,14 +75,17 @@ def summarize(directory):
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    print("case                mean ms    extra ms    peak GiB    extra GiB")
+    print(f"GPU={base['gpu']} x{base['world_size']}, global batch={base['global_batch_size']}, "
+          f"{base['measured_steps']} measured steps after {base['warmup_steps']} warmup")
+    width = max(20, max(len(case) for case in cases) + 1)
+    print(f"{'case':{width}} {'mean ms':>9} {'extra ms':>11} {'peak GiB':>11} {'extra GiB':>12}")
     for row in rows:
-        print(f"{row['case']:20} {row['mean_ms']:9.2f} {row['extra_ms_vs_sim']:11.2f} "
+        print(f"{row['case']:{width}} {row['mean_ms']:9.2f} {row['extra_ms_vs_sim']:11.2f} "
               f"{row['peak_allocated_gib']:11.2f} {row['extra_allocated_gib_vs_sim']:12.2f}")
-    adv_extra_ms = next(row["extra_ms_vs_sim"] for row in rows if row["case"] == "sim_advfd")
-    if adv_extra_ms > 0:
-        for row in rows:
-            if row["case"] in ("sim_resnet50", "sim_resnet50_swin_t"):
+    adv_extra_ms = next((row["extra_ms_vs_sim"] for row in rows if row["case"] == "sim_advfd"), None)
+    if adv_extra_ms is not None and adv_extra_ms > 0:
+        for row in rows[1:]:
+            if row["case"] != "sim_advfd":
                 print(f"{row['case']}/AdvFD incremental time ratio: "
                       f"{row['extra_ms_vs_sim'] / adv_extra_ms:.3f}")
     print(f"Saved {directory / 'summary.csv'}")
@@ -242,8 +247,9 @@ def profile():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--summarize":
-        summarize(sys.argv[2])
+    if len(sys.argv) >= 3 and sys.argv[1] == "--summarize":
+        # --summarize DIR [CASE ...]; the first CASE is the baseline (SIM).
+        summarize(sys.argv[2], sys.argv[3:])
     elif len(sys.argv) == 4 and sys.argv[1] == "--summarize_q1":
         summarize_q1(sys.argv[2], int(sys.argv[3]))
     else:
